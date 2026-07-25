@@ -1,0 +1,17 @@
+"""Sampling parameters for generation requests."""
+from dataclasses import dataclass
+
+
+@dataclass
+class SamplingParams:
+    temperature: float = 0.6
+    top_p: float = 1.0
+    top_k: int = -1
+    max_tokens: int = 256
+    ignore_eos: bool = False
+
+    def __post_init__(self):
+        if self.temperature < 0:
+            raise ValueError(f"temperature must be >= 0, got {self.temperature}")
+        if not 0.0 < self.top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
