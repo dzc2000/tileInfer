@@ -74,6 +74,13 @@ def tp_all_reduce(tensor: torch.Tensor):
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=_tp_group)
 
 
+def tp_all_reduce_async(tensor: torch.Tensor):
+    """Async All-Reduce (sum) across TP group. Returns work handle or None."""
+    if _tp_world_size > 1:
+        return dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=_tp_group, async_op=True)
+    return None
+
+
 def tp_broadcast(tensor: torch.Tensor, src: int = 0):
     """In-place broadcast a tensor from src rank to all TP ranks."""
     if _tp_world_size > 1:

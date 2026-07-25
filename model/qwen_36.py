@@ -341,6 +341,14 @@ def _create_fused_deltanet_forward(
 
     del w_qkv_full, w_a_full, w_b_full, w_z_full, w_qkv_shard, w_a_shard, w_b_shard, w_z_shard
 
+    _GEMV_BLOCK_M = 64
+    if w_delta_proj.shape[0] % _GEMV_BLOCK_M != 0:
+        pad_rows = _GEMV_BLOCK_M - (w_delta_proj.shape[0] % _GEMV_BLOCK_M)
+        w_delta_proj = torch.cat([
+            w_delta_proj,
+            torch.zeros(pad_rows, w_delta_proj.shape[1], dtype=w_delta_proj.dtype),
+        ], dim=0).contiguous()
+
     attn.in_proj_qkv = None
     attn.in_proj_a = None
     attn.in_proj_b = None
@@ -441,7 +449,7 @@ def _create_fused_deltanet_forward(
             qkv = proj_all[:, :, :delta_split_qkv]                # [B, T, tp_conv_dim]
             alpha = proj_all[:, :, delta_split_qkv:delta_split_a]  # [B, T, tp_num_v_heads]
             beta_raw = proj_all[:, :, delta_split_a:delta_split_b]  # [B, T, tp_num_v_heads]
-            z = proj_all[:, :, delta_split_b:].contiguous()         # [B, T, tp_value_dim]
+            z = proj_all[:, :, delta_split_b:delta_proj_dim].contiguous()  # [B, T, tp_value_dim]
 
             # Causal conv1d for prefill (parallel, single kernel launch)
             dn_cache = _get_deltanet_cache(layer_idx, bsz)
@@ -562,11 +570,11 @@ def _create_fused_deltanet_forward(
         x_2d = x_normed.reshape(-1, hidden_size)
 
         # ===== SINGLE GEMV for all DeltaNet projections (column-parallel) =====
-        proj_all = bf16_linear_forward(x_2d, w_delta_proj)  # [M, delta_proj_dim]
+        proj_all = bf16_linear_forward(x_2d, w_delta_proj)  # [M, delta_proj_dim_padded]
         qkv = proj_all[:, :delta_split_qkv].contiguous()                # [M, tp_conv_dim]
         alpha = proj_all[:, delta_split_qkv:delta_split_a].contiguous()  # [M, tp_num_v_heads]
         beta_raw = proj_all[:, delta_split_a:delta_split_b].contiguous()  # [M, tp_num_v_heads]
-        z = proj_all[:, delta_split_b:].contiguous()         # [M, tp_value_dim]
+        z = proj_all[:, delta_split_b:delta_proj_dim].contiguous()       # [M, tp_value_dim]
 
         dn_cache = _get_deltanet_cache(layer_idx, bsz)
 

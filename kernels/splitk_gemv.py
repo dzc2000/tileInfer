@@ -66,7 +66,7 @@ def splitk_gemv(
 
 @tilelang.jit(out_idx=[-1])
 def gemv_alloc_reducer(
-    M, N, block_M=64, block_N=128, num_stages=  2, threads=128, dtype: T.dtype = T.float16, accum_dtype: T.dtype = T.float
+    M, N, block_M=64, block_N=128, num_stages=2, threads=128, dtype: str = "bfloat16", accum_dtype: str = "float"
 ):
     @T.prim_func
     def main(
@@ -95,32 +95,27 @@ def gemv_alloc_reducer(
 def gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     dtype = str(x.dtype).replace("torch.", "")
     N, K = weight.shape
-    BLOCK_N = 8
-    reduce_threads = 32
-    kernel = splitk_gemv(N, K, BLOCK_N, reduce_threads, dtype=dtype)
-    return kernel(x, weight)
+    block_M = 64
+    block_N = 128 if K >= 128 else K
+    if N >= block_M and N % block_M == 0 and K % block_N == 0:
+        kernel = gemv_alloc_reducer(N, K, block_M=block_M, block_N=block_N,
+                                     num_stages=3, threads=128, dtype=dtype)
+        out = kernel(x, weight)
+    else:
+        BLOCK_N = min(8, N)
+        reduce_threads = 32
+        kernel = splitk_gemv(N, K, BLOCK_N, reduce_threads, dtype=dtype)
+        out = kernel(x, weight)
+    return out
 
 
 def bf16_linear_forward(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Fused linear forward: x @ W^T, matching F.linear interface.
-
-    Args:
-        x: [M, K] input tensor
-        weight: [N, K] weight tensor
-
-    Returns:
-        [M, N] output tensor
-    """
     M, K = x.shape
     N = weight.shape[0]
 
     if M == 1:
         x_flat = x.squeeze(0)
-        dtype = str(x.dtype).replace("torch.", "")
-        BLOCK_N = 8
-        reduce_threads = 32
-        kernel = splitk_gemv(N, K, BLOCK_N, reduce_threads, dtype=dtype)
-        out = kernel(x_flat, weight)
+        out = gemv(x_flat, weight)
         return out.unsqueeze(0)
     else:
         return torch.nn.functional.linear(x, weight)
