@@ -137,16 +137,15 @@ def bench_fused_lm_head(model_runner, num_runs=50):
 
         # Warmup 两条路径，确保 JIT 编译在计时前完成
         for _ in range(10):
-            _ = torch.nn.functional.linear(hidden, weight)
+            logits_tmp = torch.nn.functional.linear(hidden, weight)
             if is_tp_active():
                 import torch.distributed as dist
                 from engine.parallel import get_tp_group
-                gathered = [torch.empty_like(hidden) for _ in range(get_tp_world_size())]
-                logits_tmp = torch.nn.functional.linear(hidden, weight)
+                gathered = [torch.empty_like(logits_tmp) for _ in range(get_tp_world_size())]
                 dist.all_gather(gathered, logits_tmp, group=get_tp_group())
                 _ = torch.cat(gathered, dim=-1).argmax(dim=-1)
             else:
-                _ = torch.nn.functional.linear(hidden, weight).argmax(dim=-1)
+                _ = logits_tmp.argmax(dim=-1)
 
             if is_tp_active():
                 local_idx, local_max = fused_lm_head_argmax_with_max(hidden, weight)
