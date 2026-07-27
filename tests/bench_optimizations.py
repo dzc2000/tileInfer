@@ -135,9 +135,24 @@ def bench_fused_lm_head(model_runner, num_runs=50):
     for bsz in [1, 4, 8, 16, 32, 64]:
         hidden = torch.randn(bsz, hidden_size, dtype=dtype, device=device)
 
-        # Warmup
-        for _ in range(5):
-            _ = fused_lm_head_argmax(hidden, weight)
+        # Warmup 两条路径，确保 JIT 编译在计时前完成
+        for _ in range(10):
+            _ = torch.nn.functional.linear(hidden, weight)
+            if is_tp_active():
+                import torch.distributed as dist
+                from engine.parallel import get_tp_group
+                gathered = [torch.empty_like(hidden) for _ in range(get_tp_world_size())]
+                logits_tmp = torch.nn.functional.linear(hidden, weight)
+                dist.all_gather(gathered, logits_tmp, group=get_tp_group())
+                _ = torch.cat(gathered, dim=-1).argmax(dim=-1)
+            else:
+                _ = torch.nn.functional.linear(hidden, weight).argmax(dim=-1)
+
+            if is_tp_active():
+                local_idx, local_max = fused_lm_head_argmax_with_max(hidden, weight)
+                _ = tp_distributed_argmax_fused(local_idx, local_max, vocab_shard)
+            else:
+                _ = fused_lm_head_argmax(hidden, weight)
         torch.cuda.synchronize()
 
         # --- 原始路径: lm_head -> argmax ---
@@ -149,7 +164,6 @@ def bench_fused_lm_head(model_runner, num_runs=50):
             start.record()
             logits = torch.nn.functional.linear(hidden, weight)
             if is_tp_active():
-                # 模拟 all_gather
                 import torch.distributed as dist
                 from engine.parallel import get_tp_group
                 gathered = [torch.empty_like(logits) for _ in range(get_tp_world_size())]
@@ -162,10 +176,6 @@ def bench_fused_lm_head(model_runner, num_runs=50):
 
         # --- Fused 路径 ---
         ms_fused = []
-        for _ in range(5):
-            _ = fused_lm_head_argmax(hidden, weight)
-        torch.cuda.synchronize()
-
         for _ in range(num_runs):
             torch.cuda.synchronize()
             start = torch.cuda.Event(enable_timing=True)
