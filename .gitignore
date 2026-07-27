@@ -6,3 +6,9 @@ dist/
 build/
 *.so
 .DS_Store
+.ipynb_checkpoints/
+.tilelang_cache/
+*.egg-info/
+.DS_Store
+__pycache__/
+*.pyc
