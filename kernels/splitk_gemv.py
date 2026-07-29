@@ -92,6 +92,114 @@ def gemv_alloc_reducer(
 
     return main
 
+
+@tilelang.jit(out_idx=[-1])
+def gemv_int8_alloc_reducer(
+    M, N, block_M=64, block_N=128, num_stages=2, threads=128,
+    dtype: str = "bfloat16", accum_dtype: str = "float",
+):
+    @T.prim_func
+    def main(
+            x: T.Tensor((N,), dtype),
+            w: T.Tensor((M, N), "int8"),
+            scale: T.Tensor((M,), "float32"),
+            o: T.Tensor((M,), dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as i0_m:
+            o_reducer = T.alloc_reducer(block_M, accum_dtype, replication="all")
+            T.clear(o_reducer)
+            for i0_n in T.Pipelined(T.ceildiv(N, block_N), num_stages=num_stages):
+                w_smem = T.alloc_shared((block_M, block_N), "int8")
+                T.copy(w[i0_m * block_M, i0_n * block_N], w_smem)
+                a_frag = T.alloc_fragment((block_M, block_N), dtype)
+                for i, j in T.Parallel(block_M, block_N):
+                    a_frag[i, j] = T.cast(w_smem[i, j], dtype)
+                x_frag = T.alloc_fragment(block_N, dtype)
+                T.copy(x[i0_n * block_N], x_frag)
+                for i1_m, i1_n in T.Parallel(block_M, block_N):
+                    o_reducer[i1_m] += T.cast(a_frag[i1_m, i1_n], accum_dtype) * T.cast(x_frag[i1_n], accum_dtype)
+            T.finalize_reducer(o_reducer)
+            s_frag = T.alloc_fragment(block_M, "float32")
+            T.copy(scale[i0_m * block_M], s_frag)
+            for i in T.Parallel(block_M):
+                o_reducer[i] = o_reducer[i] * s_frag[i]
+            T.copy(o_reducer, o[i0_m * block_M])
+
+    return main
+
+
+@tilelang.jit(out_idx=[-1])
+def dequantize_gemv_kernel(
+    N: int,
+    K: int,
+    n_partition: int = 4,
+    reduce_thread: int = 32,
+    in_dtype: str = "bfloat16",
+    out_dtype: str = "bfloat16",
+    accum_dtype: str = "float",
+):
+    MAX_TRANSACTION_SIZE_IN_BITS = 128
+    micro_size_k = MAX_TRANSACTION_SIZE_IN_BITS // DataType(in_dtype).bits
+    block_K = reduce_thread * micro_size_k
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((K,), in_dtype),
+        B: T.Tensor((N, K), "int8"),
+        Scale: T.Tensor((N,), "float32"),
+        C: T.Tensor((N,), out_dtype),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, n_partition),
+            threads=(reduce_thread, n_partition),
+        ) as bx:
+            A_local = T.alloc_local((micro_size_k,), in_dtype)
+            B_local = T.alloc_local((micro_size_k,), "int8")
+            B_dequant_local = T.alloc_local((micro_size_k,), in_dtype)
+            accum_res = T.alloc_local((1,), accum_dtype)
+            reduced_accum_res = T.alloc_local((1,), accum_dtype)
+
+            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
+            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+
+            T.clear(accum_res)
+            for ko in T.serial(T.ceildiv(K, block_K)):
+                for v in T.vectorized(micro_size_k):
+                    A_local[v] = A[ko * block_K + kr * micro_size_k + v]
+
+                for v in T.vectorized(micro_size_k):
+                    B_local[v] = B[
+                        bx * n_partition + ni,
+                        ko * block_K + kr * micro_size_k + v,
+                    ]
+
+                for ki in T.serial(micro_size_k):
+                    B_dequant_local[ki] = T.cast(B_local[ki], in_dtype)
+
+                for ki in T.serial(micro_size_k):
+                    accum_res[0] += T.cast(A_local[ki], accum_dtype) * T.cast(B_dequant_local[ki], accum_dtype)
+
+            with T.attr(
+                T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)]),
+                "reduce_scope",
+                T.reinterpret(T.uint64(0), dtype="handle"),
+            ):
+                T.evaluate(
+                    T.tvm_thread_allreduce(
+                        T.uint32(1),
+                        accum_res[0],
+                        True,
+                        reduced_accum_res[0],
+                        kr,
+                        dtype="handle",
+                    )
+                )
+            if kr == 0:
+                out_idx = bx * n_partition + ni
+                C[out_idx] = T.cast(reduced_accum_res[0] * Scale[out_idx], out_dtype)
+
+    return main
+
 def gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     dtype = str(x.dtype).replace("torch.", "")
     N, K = weight.shape
@@ -109,15 +217,33 @@ def gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def bf16_linear_forward(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def gemv_int8(x: torch.Tensor, weight_int8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    N, K = weight_int8.shape
+    n_partition = 8
+    reduce_thread = 32
+    kernel = dequantize_gemv_kernel(
+        N, K, n_partition=n_partition, reduce_thread=reduce_thread,
+        in_dtype="bfloat16", out_dtype="bfloat16", accum_dtype="float",
+    )
+    out = kernel(x, weight_int8, scale)
+    return out
+
+
+def bf16_linear_forward(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor = None) -> torch.Tensor:
     M, K = x.shape
     N = weight.shape[0]
 
     if M == 1:
         x_flat = x.squeeze(0)
-        out = gemv(x_flat, weight)
+        if scale is not None:
+            out = gemv_int8(x_flat, weight, scale)
+        else:
+            out = gemv(x_flat, weight)
         return out.unsqueeze(0)
     else:
+        if scale is not None:
+            w_bf16 = (weight.to(torch.float32) * scale.unsqueeze(1)).to(x.dtype)
+            return torch.nn.functional.linear(x, w_bf16)
         return torch.nn.functional.linear(x, weight)
 
 def ref_program(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:

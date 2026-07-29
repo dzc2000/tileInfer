@@ -79,6 +79,21 @@ from engine.parallel import (
 # Layer pattern: [DeltaNet, DeltaNet, DeltaNet, Attention] x 16
 DELTANET_PATTERN = [True, True, True, False] * 16  # True = DeltaNet
 
+
+def quantize_weight_int8(w: torch.Tensor, align: int = 64):
+    N, K = w.shape
+    w_f32 = w.float()
+    amax = w_f32.abs().amax(dim=1, keepdim=True).clamp(min=1e-10)
+    scale = amax / 127.0
+    w_int8 = (w_f32 / scale).round().clamp(-128, 127).to(torch.int8)
+    scale = scale.squeeze(1).contiguous()
+    N_padded = ((N + align - 1) // align) * align
+    if N_padded > N:
+        pad_n = N_padded - N
+        w_int8 = torch.cat([w_int8, torch.zeros(pad_n, K, dtype=torch.int8, device=w.device)], dim=0)
+        scale = torch.cat([scale, torch.ones(pad_n, dtype=torch.float32, device=w.device)], dim=0).contiguous()
+    return w_int8, scale
+
 # DeltaNet dimension constants (from model config)
 NUM_K_HEADS = 16
 HEAD_K_DIM = 128
@@ -423,6 +438,15 @@ def _create_fused_deltanet_forward(
     if next_layer_norm_w is not None:
         next_layer_norm_w = next_layer_norm_w.to(device)
 
+    w_delta_proj_q, w_delta_proj_s = quantize_weight_int8(w_delta_proj)
+    del w_delta_proj
+    w_out_q, w_out_s = quantize_weight_int8(w_out)
+    del w_out
+    w_mlp_gate_up_q, w_mlp_gate_up_s = quantize_weight_int8(w_mlp_gate_up)
+    del w_mlp_gate_up
+    w_mlp_down_q, w_mlp_down_s = quantize_weight_int8(w_mlp_down)
+    del w_mlp_down
+
     def fused_forward(
         hidden_states: torch.Tensor,
         attention_mask=None,
@@ -444,7 +468,7 @@ def _create_fused_deltanet_forward(
             x_2d = x_normed.reshape(-1, hidden_size)
 
             # Single GEMV for all DeltaNet projections (column-parallel, no comm)
-            proj_all = bf16_linear_forward(x_2d, w_delta_proj)  # [B*T, delta_proj_dim]
+            proj_all = bf16_linear_forward(x_2d, w_delta_proj_q, w_delta_proj_s)  # [B*T, delta_proj_dim]
             proj_all = proj_all.reshape(bsz, q_len, -1)
             qkv = proj_all[:, :, :delta_split_qkv]                # [B, T, tp_conv_dim]
             alpha = proj_all[:, :, delta_split_qkv:delta_split_a]  # [B, T, tp_num_v_heads]
@@ -533,7 +557,7 @@ def _create_fused_deltanet_forward(
 
             # Output projection (row-parallel -> All-Reduce)
             o_2d = attn_output.reshape(-1, tp_value_dim)
-            attn_output = bf16_linear_forward(o_2d, w_out).reshape(bsz, q_len, hidden_size)
+            attn_output = bf16_linear_forward(o_2d, w_out_q, w_out_s).reshape(bsz, q_len, hidden_size)
             ar_work = None
             if is_tp_active():
                 ar_work = tp_all_reduce_async(attn_output)
@@ -547,12 +571,12 @@ def _create_fused_deltanet_forward(
 
             # MLP block (column-parallel gate_up, row-parallel down -> All-Reduce)
             x_2d = x_normed.reshape(-1, hidden_size)
-            gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up)
+            gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up_q, w_mlp_gate_up_s)
             gate_out = gate_up[:, :tp_intermediate_size]
             up_out = gate_up[:, tp_intermediate_size:]
             mlp_mid = fused_silu_mul(gate_out, up_out)
             down_out = bf16_linear_forward(
-                mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down,
+                mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down_q, w_mlp_down_s,
             ).reshape(bsz, q_len, hidden_size)
             ar_work2 = None
             if is_tp_active():
@@ -576,11 +600,18 @@ def _create_fused_deltanet_forward(
         x_2d = x_normed.reshape(-1, hidden_size)
 
         # ===== SINGLE GEMV for all DeltaNet projections (column-parallel) =====
-        proj_all = bf16_linear_forward(x_2d, w_delta_proj)  # [M, delta_proj_dim_padded]
-        qkv = proj_all[:, :delta_split_qkv].contiguous()                # [M, tp_conv_dim]
-        alpha = proj_all[:, delta_split_qkv:delta_split_a].contiguous()  # [M, tp_num_v_heads]
-        beta_raw = proj_all[:, delta_split_a:delta_split_b].contiguous()  # [M, tp_num_v_heads]
-        z = proj_all[:, delta_split_b:delta_proj_dim].contiguous()       # [M, tp_value_dim]
+        proj_all = bf16_linear_forward(x_2d, w_delta_proj_q, w_delta_proj_s)  # [M, delta_proj_dim_padded]
+        if bsz == 1:
+            _p = proj_all.view(-1)
+            qkv = _p[:delta_split_qkv].view(1, -1)
+            alpha = _p[delta_split_qkv:delta_split_a].view(1, -1)
+            beta_raw = _p[delta_split_a:delta_split_b].view(1, -1)
+            z = _p[delta_split_b:delta_proj_dim].view(1, -1)
+        else:
+            qkv = proj_all[:, :delta_split_qkv].contiguous()
+            alpha = proj_all[:, delta_split_qkv:delta_split_a].contiguous()
+            beta_raw = proj_all[:, delta_split_a:delta_split_b].contiguous()
+            z = proj_all[:, delta_split_b:delta_proj_dim].contiguous()
 
         dn_cache = _get_deltanet_cache(layer_idx, bsz)
 
@@ -589,10 +620,6 @@ def _create_fused_deltanet_forward(
         qkv_conv = causal_conv1d_update(
             qkv_flat, dn_cache.conv_state, conv_w, conv_b, apply_silu=True,
         )
-
-        # Write back conv state to paged pool (fancy indexing creates a copy)
-        if dn_cache.slots is not None:
-            _deltanet_conv_pool[dn_cache.dn_idx, dn_cache.slots] = dn_cache.conv_state
 
         # ===== FUSED POST-PROJ + RECURRENT (TP-adjusted) =====
         z_3d = z.reshape(bsz, tp_num_v_heads, HEAD_V_DIM)
@@ -604,16 +631,17 @@ def _create_fused_deltanet_forward(
         )
         attn_output = attn_output.reshape(bsz, 1, tp_value_dim)
 
-        # Write back recurrent state to paged pool
-        if dn_cache.slots is not None:
-            _deltanet_recurrent_pool[dn_cache.dn_idx, dn_cache.slots] = dn_cache.recurrent_state
-
         # Output projection (row-parallel -> All-Reduce)
         o_2d = attn_output.reshape(-1, tp_value_dim)
-        attn_output = bf16_linear_forward(o_2d, w_out).reshape(bsz, q_len, hidden_size)
+        attn_output = bf16_linear_forward(o_2d, w_out_q, w_out_s).reshape(bsz, q_len, hidden_size)
         ar_work = None
         if is_tp_active():
             ar_work = tp_all_reduce_async(attn_output)
+
+        # Overlap state write-backs with NCCL communication
+        if dn_cache.slots is not None:
+            _deltanet_conv_pool[dn_cache.dn_idx, dn_cache.slots] = dn_cache.conv_state
+            _deltanet_recurrent_pool[dn_cache.dn_idx, dn_cache.slots] = dn_cache.recurrent_state
 
         # ===== FUSED RESIDUAL + RMSNORM =====
         if ar_work is not None:
@@ -628,15 +656,19 @@ def _create_fused_deltanet_forward(
         x_2d = x_normed.reshape(-1, hidden_size)
 
         # ===== SINGLE GEMV for gate+up projections (column-parallel) =====
-        gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up)
-        gate_out = gate_up[:, :tp_intermediate_size]
-        up_out = gate_up[:, tp_intermediate_size:]
-
+        gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up_q, w_mlp_gate_up_s)
+        if bsz == 1:
+            _gu = gate_up.view(-1)
+            gate_out = _gu[:tp_intermediate_size].view(1, -1)
+            up_out = _gu[tp_intermediate_size:tp_intermediate_size * 2].view(1, -1)
+        else:
+            gate_out = gate_up[:, :tp_intermediate_size].contiguous()
+            up_out = gate_up[:, tp_intermediate_size:].contiguous()
         mlp_mid = fused_silu_mul(gate_out, up_out)
 
         # down_proj (row-parallel -> All-Reduce)
         down_out = bf16_linear_forward(
-            mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down,
+            mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down_q, w_mlp_down_s,
         ).reshape(bsz, q_len, hidden_size)
         ar_work2 = None
         if is_tp_active():
@@ -753,6 +785,15 @@ def _create_fused_attention_forward(
     if next_layer_norm_w is not None:
         next_layer_norm_w = next_layer_norm_w.to(device)
 
+    w_attn_qkv_q, w_attn_qkv_s = quantize_weight_int8(w_attn_qkv)
+    del w_attn_qkv
+    w_o_q, w_o_s = quantize_weight_int8(w_o)
+    del w_o
+    w_mlp_gate_up_q, w_mlp_gate_up_s = quantize_weight_int8(w_mlp_gate_up)
+    del w_mlp_gate_up
+    w_mlp_down_q, w_mlp_down_s = quantize_weight_int8(w_mlp_down)
+    del w_mlp_down
+
     def fused_forward(
         hidden_states: torch.Tensor,
         attention_mask=None,
@@ -780,7 +821,7 @@ def _create_fused_attention_forward(
         x_2d = x_normed.reshape(-1, hidden_size)
 
         # ===== SINGLE GEMV for Q+K+V (column-parallel, no comm) =====
-        qkv_all = bf16_linear_forward(x_2d, w_attn_qkv)  # [M, attn_qkv_dim]
+        qkv_all = bf16_linear_forward(x_2d, w_attn_qkv_q, w_attn_qkv_s)  # [M, attn_qkv_dim]
         q_full = qkv_all[:, :attn_split_q]           # [M, tp_q_proj_dim]
         k = qkv_all[:, attn_split_q:attn_split_k]    # [M, tp_kv_out_dim]
         v = qkv_all[:, attn_split_k:]                 # [M, tp_kv_out_dim]
@@ -835,8 +876,12 @@ def _create_fused_attention_forward(
         ctx = get_context()
 
         # Store K/V into paged cache (TP-adjusted: tp_num_kv_heads)
-        k_store = k.transpose(1, 2).reshape(-1, tp_num_kv_heads, HEAD_DIM).contiguous()
-        v_store = v.transpose(1, 2).reshape(-1, tp_num_kv_heads, HEAD_DIM).contiguous()
+        if q_len == 1:
+            k_store = k.squeeze(2)
+            v_store = v.squeeze(2)
+        else:
+            k_store = k.transpose(1, 2).reshape(-1, tp_num_kv_heads, HEAD_DIM).contiguous()
+            v_store = v.transpose(1, 2).reshape(-1, tp_num_kv_heads, HEAD_DIM).contiguous()
         attn_layer_idx = _get_attention_layer_idx(layer_idx)
         k_cache = _paged_kv_cache[0, attn_layer_idx].reshape(-1, tp_num_kv_heads * HEAD_DIM)
         v_cache = _paged_kv_cache[1, attn_layer_idx].reshape(-1, tp_num_kv_heads * HEAD_DIM)
@@ -909,7 +954,7 @@ def _create_fused_attention_forward(
 
         # Output projection (row-parallel -> All-Reduce)
         o_2d = attn_output.reshape(-1, tp_q_out_dim)
-        attn_output = bf16_linear_forward(o_2d, w_o).reshape(bsz, q_len, hidden_size)
+        attn_output = bf16_linear_forward(o_2d, w_o_q, w_o_s).reshape(bsz, q_len, hidden_size)
         ar_work = None
         if is_tp_active():
             ar_work = tp_all_reduce_async(attn_output)
@@ -926,16 +971,20 @@ def _create_fused_attention_forward(
         # ============================================================
         x_2d = x_normed.reshape(-1, hidden_size)
 
-        # ===== SINGLE GEMV for gate+up (column-parallel) =====
-        gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up)
-        gate_out = gate_up[:, :tp_intermediate_size]
-        up_out = gate_up[:, tp_intermediate_size:]
-
+        # ===== SINGLE GEMV for gate+up projections (column-parallel) =====
+        gate_up = bf16_linear_forward(x_2d, w_mlp_gate_up_q, w_mlp_gate_up_s)
+        if gate_up.shape[0] == 1:
+            _gu = gate_up.view(-1)
+            gate_out = _gu[:tp_intermediate_size].view(1, -1)
+            up_out = _gu[tp_intermediate_size:tp_intermediate_size * 2].view(1, -1)
+        else:
+            gate_out = gate_up[:, :tp_intermediate_size].contiguous()
+            up_out = gate_up[:, tp_intermediate_size:].contiguous()
         mlp_mid = fused_silu_mul(gate_out, up_out)
 
         # down_proj (row-parallel -> All-Reduce)
         down_out = bf16_linear_forward(
-            mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down,
+            mlp_mid.reshape(-1, tp_intermediate_size), w_mlp_down_q, w_mlp_down_s,
         ).reshape(bsz, q_len, hidden_size)
         ar_work2 = None
         if is_tp_active():

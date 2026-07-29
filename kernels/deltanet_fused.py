@@ -327,11 +327,317 @@ def fused_postproj_recurrent_kernel_gemm(B, num_k_heads, num_v_heads, Dk, Dv, BL
 
     return kernel
 
+@tilelang.jit(out_idx=[-2, -1])
+def fused_postproj_recurrent_kernel_v3(B, num_k_heads, num_v_heads, Dk, Dv, FUSE_NORM, dtype):
+    """v3: 单次 State 读取 + 内联 decay + 共享内存直写 NewState
+
+    优化点:
+    1. BLOCK_DK = Dk (128), 一次性加载整个 State 到共享内存
+    2. 消除 S_decayed 中间 buffer, decay 内联到计算中
+    3. NewState 直接从共享内存的 S_tile 写, 无需二次读取 State
+    4. GMEM 流量: v2 的 96KB (2 read + 1 write) → 64KB (1 read + 1 write)
+    """
+    V_PER_K = num_v_heads // num_k_heads
+    INV_SQRT_DK = Dk ** -0.5
+    KEY_DIM = num_k_heads * Dk
+    CONV_DIM = KEY_DIM * 2 + num_v_heads * Dv
+
+    @T.prim_func
+    def kernel(
+        QKV: T.Tensor((B, CONV_DIM), dtype),
+        Alpha: T.Tensor((B, num_v_heads), dtype),
+        BetaRaw: T.Tensor((B, num_v_heads), dtype),
+        NegAExp: T.Tensor((num_v_heads,), dtype),
+        DtBias: T.Tensor((num_v_heads,), dtype),
+        State: T.Tensor((B, num_v_heads, Dk, Dv), dtype),
+        NormW: T.Tensor((Dv,), dtype),
+        Z: T.Tensor((B, num_v_heads, Dv), dtype),
+        NewState: T.Tensor((B, num_v_heads, Dk, Dv), dtype),
+        Output: T.Tensor((B, num_v_heads, Dv), dtype),
+    ):
+        with T.Kernel(num_v_heads, B, threads=THREADS) as (h, bid):
+            k_head = h // V_PER_K
+
+            # ===== Load q, k, v =====
+            q_full = T.alloc_shared((Dk,), dtype)
+            k_full = T.alloc_shared((Dk,), dtype)
+            v = T.alloc_shared((Dv,), dtype)
+            T.copy(QKV[bid, k_head * Dk], q_full)
+            T.copy(QKV[bid, KEY_DIM + k_head * Dk], k_full)
+            T.copy(QKV[bid, KEY_DIM * 2 + h * Dv], v)
+
+            # ===== Normalize q =====
+            pow_frag = T.alloc_fragment((Dk,), T.float32)
+            pow_sum_frag = T.alloc_fragment((1,), T.float32)
+            for i in T.Parallel(Dk):
+                pow_frag[i] = T.cast(q_full[i], T.float32) * T.cast(q_full[i], T.float32)
+            T.reduce_sum(pow_frag, pow_sum_frag, dim=-1)
+            q_norm = T.max(T.sqrt(pow_sum_frag[0]), T.float32(1e-6))
+            for i in T.Parallel(Dk):
+                q_full[i] = T.cast((T.cast(q_full[i], T.float32) / q_norm) * INV_SQRT_DK, dtype)
+
+            # ===== Normalize k =====
+            for i in T.Parallel(Dk):
+                pow_frag[i] = T.cast(k_full[i], T.float32) * T.cast(k_full[i], T.float32)
+            T.reduce_sum(pow_frag, pow_sum_frag, dim=-1)
+            k_norm = T.max(T.sqrt(pow_sum_frag[0]), T.float32(1e-6))
+            for i in T.Parallel(Dk):
+                k_full[i] = T.cast(T.cast(k_full[i], T.float32) / k_norm, dtype)
+
+            # ===== Compute decay, beta =====
+            alpha_val = T.cast(Alpha[bid, h], T.float32)
+            neg_a_exp_val = T.cast(NegAExp[h], T.float32)
+            dt_bias_val = T.cast(DtBias[h], T.float32)
+            sp_input = alpha_val + dt_bias_val
+            sp = T.if_then_else(sp_input > 20.0, sp_input, T.log(1.0 + T.exp(sp_input)))
+            gate = neg_a_exp_val * sp
+            decay = T.exp(gate)
+            beta = T.sigmoid(T.cast(BetaRaw[bid, h], T.float32))
+
+            # ===== Compute qk_dot (before State load, can overlap) =====
+            qk_frag = T.alloc_fragment((Dk,), T.float32)
+            qk_sum = T.alloc_fragment((1,), T.float32)
+            for i in T.Parallel(Dk):
+                qk_frag[i] = T.cast(q_full[i], T.float32) * T.cast(k_full[i], T.float32)
+            T.reduce_sum(qk_frag, qk_sum, dim=-1)
+            qk_dot = qk_sum[0]
+
+            # ===== Load full State to shared memory (SINGLE GMEM READ) =====
+            S_tile = T.alloc_shared((Dk, Dv), dtype)
+            T.copy(State[bid, h, 0, 0], S_tile)
+
+            # ===== Single pass: accum_sk + accum_sq (decay inline, no S_decayed buffer) =====
+            accum_sk = T.alloc_shared((Dv,), T.float32)
+            accum_sq = T.alloc_shared((Dv,), T.float32)
+            T.clear(accum_sk)
+            T.clear(accum_sq)
+
+            for j in T.Parallel(Dv):
+                dot_k = T.alloc_local([1], T.float32)
+                dot_q = T.alloc_local([1], T.float32)
+                dot_k[0] = T.float32(0.0)
+                dot_q[0] = T.float32(0.0)
+                for i in T.serial(Dk):
+                    s_val = T.cast(S_tile[i, j], T.float32) * decay
+                    dot_k[0] = dot_k[0] + s_val * T.cast(k_full[i], T.float32)
+                    dot_q[0] = dot_q[0] + s_val * T.cast(q_full[i], T.float32)
+                accum_sk[j] = dot_k[0]
+                accum_sq[j] = dot_q[0]
+
+            # ===== delta = beta * (v - accum_sk) =====
+            delta = T.alloc_shared((Dv,), T.float32)
+            for j in T.Parallel(Dv):
+                delta[j] = beta * (T.cast(v[j], T.float32) - accum_sk[j])
+
+            # ===== output = accum_sq + qk_dot * delta =====
+            output = T.alloc_shared((Dv,), T.float32)
+            for j in T.Parallel(Dv):
+                output[j] = accum_sq[j] + qk_dot * delta[j]
+
+            # ===== Write NewState from S_tile (shared memory, NO re-read!) =====
+            # NewState = State * decay + outer(k, delta)
+            for i, j in T.Parallel(Dk, Dv):
+                new_val = T.cast(S_tile[i, j], T.float32) * decay + T.cast(k_full[i], T.float32) * delta[j]
+                NewState[bid, h, i, j] = T.cast(new_val, dtype)
+
+            # ===== RMSNorm + Z gate =====
+            if FUSE_NORM:
+                out_sq = T.alloc_shared((Dv,), T.float32)
+                for j in T.Parallel(Dv):
+                    out_sq[j] = output[j] * output[j]
+                var_buf = T.alloc_shared((1,), T.float32)
+                T.reduce_sum(out_sq, var_buf, dim=-1)
+                var_val = var_buf[0] / T.float32(Dv)
+                rrms = T.rsqrt(var_val + T.float32(1e-6))
+
+                norm_w = T.alloc_shared((Dv,), T.float32)
+                T.copy(NormW[0], norm_w)
+
+                o_normed = T.alloc_shared((Dv,), T.float32)
+                for j in T.Parallel(Dv):
+                    o_normed[j] = output[j] * rrms * norm_w[j]
+
+                z_val = T.alloc_shared((Dv,), T.float32)
+                T.copy(Z[bid, h, 0], z_val)
+
+                final_output = T.alloc_shared((Dv,), dtype)
+                for j in T.Parallel(Dv):
+                    sig_z = T.sigmoid(z_val[j])
+                    final_output[j] = T.cast(o_normed[j] * sig_z * z_val[j], dtype)
+
+                T.copy(final_output, Output[bid, h, 0])
+            else:
+                final_output = T.alloc_shared((Dv,), dtype)
+                for j in T.Parallel(Dv):
+                    final_output[j] = T.cast(output[j], dtype)
+                T.copy(final_output, Output[bid, h, 0])
+
+    return kernel
+
+@tilelang.jit(out_idx=[-3, -2, -1])
+def fused_postproj_recurrent_kernel_v4(B, num_k_heads, num_v_heads, Dk, Dv, TILE_DV, dtype):
+    """v4: Dv-tiled recurrent kernel for high SM utilization.
+
+    v2/v3 use grid=(num_v_heads, B) = 24 blocks on A100 (108 SMs) → 22% utilization.
+    v4 tiles Dv into TILE_DV chunks → grid=(num_v_heads * Dv/TILE_DV, B) = 192 blocks.
+    Each block handles state[Dk, TILE_DV] slice independently.
+    RMSNorm requires global Dv reduction → deferred to separate norm_gate kernel.
+    """
+    V_PER_K = num_v_heads // num_k_heads
+    INV_SQRT_DK = Dk ** -0.5
+    KEY_DIM = num_k_heads * Dk
+    CONV_DIM = KEY_DIM * 2 + num_v_heads * Dv
+    num_dv_tiles = Dv // TILE_DV
+
+    @T.prim_func
+    def kernel(
+        QKV: T.Tensor((B, CONV_DIM), dtype),
+        Alpha: T.Tensor((B, num_v_heads), dtype),
+        BetaRaw: T.Tensor((B, num_v_heads), dtype),
+        NegAExp: T.Tensor((num_v_heads,), dtype),
+        DtBias: T.Tensor((num_v_heads,), dtype),
+        State: T.Tensor((B, num_v_heads, Dk, Dv), dtype),
+        NewState: T.Tensor((B, num_v_heads, Dk, Dv), dtype),
+        RawOutput: T.Tensor((B, num_v_heads, Dv), dtype),
+        PartialSq: T.Tensor((B, num_v_heads, num_dv_tiles), T.float32),
+    ):
+        with T.Kernel(num_v_heads * num_dv_tiles, B, threads=THREADS) as (h_tile, bid):
+            h = h_tile // num_dv_tiles
+            tile_idx = h_tile % num_dv_tiles
+            k_head = h // V_PER_K
+            dv_start = tile_idx * TILE_DV
+
+            q_full = T.alloc_shared((Dk,), dtype)
+            k_full = T.alloc_shared((Dk,), dtype)
+            v_tile = T.alloc_shared((TILE_DV,), dtype)
+            T.copy(QKV[bid, k_head * Dk], q_full)
+            T.copy(QKV[bid, KEY_DIM + k_head * Dk], k_full)
+            T.copy(QKV[bid, KEY_DIM * 2 + h * Dv + dv_start], v_tile)
+
+            pow_frag = T.alloc_fragment((Dk,), T.float32)
+            pow_sum_frag = T.alloc_fragment((1,), T.float32)
+            for i in T.Parallel(Dk):
+                pow_frag[i] = T.cast(q_full[i], T.float32) * T.cast(q_full[i], T.float32)
+            T.reduce_sum(pow_frag, pow_sum_frag, dim=-1)
+            q_norm = T.max(T.sqrt(pow_sum_frag[0]), T.float32(1e-6))
+            for i in T.Parallel(Dk):
+                q_full[i] = T.cast((T.cast(q_full[i], T.float32) / q_norm) * INV_SQRT_DK, dtype)
+
+            for i in T.Parallel(Dk):
+                pow_frag[i] = T.cast(k_full[i], T.float32) * T.cast(k_full[i], T.float32)
+            T.reduce_sum(pow_frag, pow_sum_frag, dim=-1)
+            k_norm = T.max(T.sqrt(pow_sum_frag[0]), T.float32(1e-6))
+            for i in T.Parallel(Dk):
+                k_full[i] = T.cast(T.cast(k_full[i], T.float32) / k_norm, dtype)
+
+            alpha_val = T.cast(Alpha[bid, h], T.float32)
+            neg_a_exp_val = T.cast(NegAExp[h], T.float32)
+            dt_bias_val = T.cast(DtBias[h], T.float32)
+            sp_input = alpha_val + dt_bias_val
+            sp = T.if_then_else(sp_input > 20.0, sp_input, T.log(1.0 + T.exp(sp_input)))
+            decay = T.exp(neg_a_exp_val * sp)
+            beta = T.sigmoid(T.cast(BetaRaw[bid, h], T.float32))
+
+            qk_frag = T.alloc_fragment((Dk,), T.float32)
+            qk_sum = T.alloc_fragment((1,), T.float32)
+            for i in T.Parallel(Dk):
+                qk_frag[i] = T.cast(q_full[i], T.float32) * T.cast(k_full[i], T.float32)
+            T.reduce_sum(qk_frag, qk_sum, dim=-1)
+            qk_dot = qk_sum[0]
+
+            S_tile = T.alloc_shared((Dk, TILE_DV), dtype)
+            T.copy(State[bid, h, 0, dv_start], S_tile)
+
+            accum_sk = T.alloc_shared((TILE_DV,), T.float32)
+            accum_sq = T.alloc_shared((TILE_DV,), T.float32)
+            T.clear(accum_sk)
+            T.clear(accum_sq)
+
+            for jj in T.Parallel(TILE_DV):
+                dot_k = T.alloc_local([1], T.float32)
+                dot_q = T.alloc_local([1], T.float32)
+                dot_k[0] = T.float32(0.0)
+                dot_q[0] = T.float32(0.0)
+                for i in T.serial(Dk):
+                    s_val = T.cast(S_tile[i, jj], T.float32) * decay
+                    dot_k[0] = dot_k[0] + s_val * T.cast(k_full[i], T.float32)
+                    dot_q[0] = dot_q[0] + s_val * T.cast(q_full[i], T.float32)
+                accum_sk[jj] = dot_k[0]
+                accum_sq[jj] = dot_q[0]
+
+            delta = T.alloc_shared((TILE_DV,), T.float32)
+            for jj in T.Parallel(TILE_DV):
+                delta[jj] = beta * (T.cast(v_tile[jj], T.float32) - accum_sk[jj])
+
+            for jj in T.Parallel(TILE_DV):
+                out_val = accum_sq[jj] + qk_dot * delta[jj]
+                RawOutput[bid, h, dv_start + jj] = T.cast(out_val, dtype)
+
+            sq_sum = T.alloc_local([1], T.float32)
+            sq_sum[0] = T.float32(0.0)
+            for jj in T.serial(TILE_DV):
+                ov = accum_sq[jj] + qk_dot * delta[jj]
+                sq_sum[0] = sq_sum[0] + ov * ov
+            PartialSq[bid, h, tile_idx] = sq_sum[0]
+
+            for i, jj in T.Parallel(Dk, TILE_DV):
+                new_val = T.cast(S_tile[i, jj], T.float32) * decay + T.cast(k_full[i], T.float32) * delta[jj]
+                NewState[bid, h, i, dv_start + jj] = T.cast(new_val, dtype)
+
+    return kernel
+
+
+@tilelang.jit(out_idx=[-1])
+def deltanet_norm_gate_kernel(B, num_v_heads, Dv, num_dv_tiles, FUSE_NORM, dtype):
+    """Post-processing: sum partial sq → RMSNorm → Z gate.
+
+    Grid = (num_v_heads, B). Each block handles one head's Dv elements.
+    """
+    @T.prim_func
+    def kernel(
+        RawOutput: T.Tensor((B, num_v_heads, Dv), dtype),
+        PartialSq: T.Tensor((B, num_v_heads, num_dv_tiles), T.float32),
+        NormW: T.Tensor((Dv,), dtype),
+        Z: T.Tensor((B, num_v_heads, Dv), dtype),
+        Output: T.Tensor((B, num_v_heads, Dv), dtype),
+    ):
+        with T.Kernel(num_v_heads, B, threads=THREADS) as (h, bid):
+            raw = T.alloc_shared((Dv,), dtype)
+            T.copy(RawOutput[bid, h, 0], raw)
+
+            if FUSE_NORM:
+                total_sq = T.alloc_local([1], T.float32)
+                total_sq[0] = T.float32(0.0)
+                for t in T.serial(num_dv_tiles):
+                    total_sq[0] = total_sq[0] + PartialSq[bid, h, t]
+
+                rrms = T.rsqrt(total_sq[0] / T.float32(Dv) + T.float32(1e-6))
+
+                norm_w = T.alloc_shared((Dv,), T.float32)
+                T.copy(NormW[0], norm_w)
+
+                z_val = T.alloc_shared((Dv,), T.float32)
+                T.copy(Z[bid, h, 0], z_val)
+
+                out = T.alloc_shared((Dv,), dtype)
+                for j in T.Parallel(Dv):
+                    o_normed = T.cast(raw[j], T.float32) * rrms * norm_w[j]
+                    sig_z = T.sigmoid(z_val[j])
+                    out[j] = T.cast(o_normed * sig_z * z_val[j], dtype)
+                T.copy(out, Output[bid, h, 0])
+            else:
+                T.copy(raw, Output[bid, h, 0])
+
+    return kernel
+
+
 def dispatch(device):
     props = torch.cuda.get_device_properties(device)
     sm_version = props.major * 10 + props.minor
     if sm_version >= 90:
         return 'gemm'
+    if sm_version >= 80:
+        return 'v4'
     return 'v2'
 
 def fused_postproj_recurrent(
@@ -350,12 +656,27 @@ def fused_postproj_recurrent(
         z = torch.empty(B, num_v_heads, Dv, device=qkv_conv.device, dtype=torch.bfloat16)
 
     style = dispatch(qkv_conv.device)
-    if style == 'gemm':
-        kernel_func = fused_postproj_recurrent_kernel_gemm
-    else:
-        kernel_func = fused_postproj_recurrent_kernel_v2
 
-    kernel = kernel_func(B, num_k_heads, num_v_heads, Dk, Dv, BLOCK_DK, fuse_norm, dtype)
+    if style == 'v4':
+        TILE_DV = DV_TILE
+        num_dv_tiles = Dv // TILE_DV
+        rec_kernel = fused_postproj_recurrent_kernel_v4(
+            B, num_k_heads, num_v_heads, Dk, Dv, TILE_DV, dtype)
+        new_state, raw_output, partial_sq = rec_kernel(
+            qkv_conv.contiguous(), alpha.contiguous(), beta_raw.contiguous(),
+            neg_A_exp, dt_bias_f, state.contiguous())
+
+        ng_kernel = deltanet_norm_gate_kernel(
+            B, num_v_heads, Dv, num_dv_tiles, fuse_norm, dtype)
+        out = ng_kernel(raw_output, partial_sq, norm_weight, z.contiguous())
+        return out, new_state
+
+    if style == 'gemm':
+        kernel = fused_postproj_recurrent_kernel_gemm(
+            B, num_k_heads, num_v_heads, Dk, Dv, BLOCK_DK, fuse_norm, dtype)
+    else:
+        kernel = fused_postproj_recurrent_kernel_v2(
+            B, num_k_heads, num_v_heads, Dk, Dv, BLOCK_DK, fuse_norm, dtype)
 
     new_state, out = kernel(qkv_conv.contiguous(), alpha.contiguous(), beta_raw.contiguous(),
                             neg_A_exp, dt_bias_f, state.contiguous(),

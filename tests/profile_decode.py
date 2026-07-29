@@ -81,8 +81,15 @@ def main():
         print(f"\n  Prompt: {prompt_len} tokens")
         print(f"  Generated: {completion_tokens} tokens")
 
+        # key_averages() 按名称聚合，避免 10万+ 条原始事件
+        events = prof.key_averages()
+
+        # 兼容新旧 PyTorch: device_time_total (新) / cuda_time_total (旧)
+        def _dev_time(e):
+            return getattr(e, "device_time_total", None) or getattr(e, "cuda_time_total", 0)
+
         # Per-step estimate
-        total_cuda = sum(e.cuda_time_total for e in prof.key_averages()) / 1000
+        total_cuda = sum(_dev_time(e) for e in events) / 1000
         per_step_ms = total_cuda / max(completion_tokens, 1)
         print(f"  Total CUDA time: {total_cuda:.1f} ms")
         print(f"  Est. per-step: {per_step_ms:.2f} ms/token")
@@ -93,17 +100,15 @@ def main():
         print(f"  Operator Category Breakdown")
         print(f"{'='*80}")
 
-        events = prof.key_averages()
-
         categories = {
-            "GEMM/Linear": ["gemm", "linear", "mm", "addmm", "matmul"],
-            "Elementwise": ["elementwise", "mul", "add", "div", "sub", "sigmoid", "softmax", "silu", "gelu"],
+            "GEMM/Linear": ["gemm", "linear", "mm", "addmm", "matmul", "cublas"],
+            "Elementwise": ["elementwise", "mul", "add", "div", "sub", "sigmoid", "softmax", "silu", "gelu", "pointwise", "binary"],
             "Reduction": ["reduce", "sum", "max", "argmax", "norm", "rms"],
-            "Attention": ["attention", "flash", "gqa", "sdpa", "varlen", "paged"],
-            "DeltaNet": ["deltanet", "recurrent", "delta", "conv1d", "flashqla"],
-            "RoPE": ["rope", "rotary"],
-            "Communication": ["all_reduce", "all_gather", "broadcast", "nccl", "wait"],
-            "Memory": ["copy", "view", "reshape", "slice", "cat", "contiguous", "clone", "to"],
+            "Attention": ["attention", "flash", "gqa", "sdpa", "varlen", "paged", "decode_kernel"],
+            "DeltaNet": ["deltanet", "recurrent", "delta", "conv1d", "flashqla", "fused_postproj", "state"],
+            "RoPE": ["rope", "rotary", "qknorm"],
+            "Communication": ["all_reduce", "all_gather", "broadcast", "nccl", "wait", "record_param"],
+            "Memory": ["copy", "view", "reshape", "slice", "cat", "contiguous", "clone", "to", "empty", "zero", "fill"],
             "Embedding": ["embedding", "embed", "gather"],
             "Other": [],
         }
@@ -112,18 +117,19 @@ def main():
         cat_counts = {cat: 0 for cat in categories}
 
         for e in events:
-            if e.cuda_time_total == 0:
+            t = _dev_time(e)
+            if t == 0:
                 continue
             name_lower = e.key.lower()
             matched = False
             for cat, keywords in categories.items():
                 if any(kw in name_lower for kw in keywords):
-                    cat_times[cat] += e.cuda_time_total / 1000
+                    cat_times[cat] += t / 1000
                     cat_counts[cat] += e.count
                     matched = True
                     break
             if not matched:
-                cat_times["Other"] += e.cuda_time_total / 1000
+                cat_times["Other"] += t / 1000
                 cat_counts["Other"] += e.count
 
         total = sum(cat_times.values())
@@ -145,8 +151,8 @@ def main():
         print(f"{'='*80}")
 
         cuda_events = sorted(
-            [e for e in events if e.cuda_time_total > 0],
-            key=lambda e: e.cuda_time_total,
+            [e for e in events if _dev_time(e) > 0],
+            key=lambda e: _dev_time(e),
             reverse=True,
         )[:args.top_k]
 
@@ -155,10 +161,28 @@ def main():
 
         for e in cuda_events:
             name = e.key[:55]
-            cuda_ms = e.cuda_time_total / 1000
+            t = _dev_time(e)
+            cuda_ms = t / 1000
             calls = e.count
-            avg_us = e.cuda_time_total / e.count if e.count > 0 else 0
+            avg_us = t / calls if calls > 0 else 0
             print(f"  {name:<55s} | {cuda_ms:>10.3f} | {calls:>6d} | {avg_us:>10.1f}")
+
+        # 额外: 列出所有 unique kernel 名称 (调试用)
+        print(f"\n{'='*80}")
+        print(f"  All Unique Operators (sorted by time)")
+        print(f"{'='*80}")
+        all_events = sorted(
+            [e for e in events if _dev_time(e) > 0],
+            key=lambda e: _dev_time(e),
+            reverse=True,
+        )
+        print(f"  Total unique operators: {len(all_events)}")
+        print(f"  {'Name':<70s} | {'CUDA(ms)':>10s} | {'Calls':>8s}")
+        print(f"  {'-'*70}-+-{'-'*10}-+-{'-'*8}")
+        for e in all_events:
+            name = e.key[:70]
+            t = _dev_time(e)
+            print(f"  {name:<70s} | {t/1000:>10.3f} | {e.count:>8d}")
 
         # Chrome trace
         if args.trace:
