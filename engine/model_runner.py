@@ -105,6 +105,7 @@ class ModelRunner:
         self.deltanet_conv_pool = None
         self.free_deltanet_slots: deque[int] = deque()
         self.seq_to_slot: dict[int, int] = {}
+        self.oom_preempted: list = []
 
         self.model = None
 
@@ -700,12 +701,11 @@ class ModelRunner:
                         f"Try reducing max_num_seqs, max_model_len, or "
                         f"max_prefill_chunk_tokens."
                     ) from None
-                # Clear fragmented cache and preempt the last sequence.
                 torch.cuda.empty_cache()
                 if len(seqs) > 1:
                     preempted = seqs.pop()
                     self.free_deltanet_slot(preempted.seq_id)
-                # Retry with reduced batch (or same batch after cache clear).
+                    self.oom_preempted.append(preempted)
 
     def _run_impl(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Core execution logic for one step (without OOM handling)."""

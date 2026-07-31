@@ -1,8 +1,9 @@
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
 .tilelang_cache/
-*.json
-*.pt
-*.bin
-*.safetensors
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.so
+.DS_Store

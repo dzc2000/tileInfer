@@ -154,11 +154,23 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return []
+        self.model_runner.oom_preempted.clear()
         token_ids = self.model_runner.run(seqs, is_prefill)
+
+        # Handle sequences that were dropped due to OOM during execution.
+        # Put them back into the scheduler's waiting queue for recompute.
+        for preempted_seq in self.model_runner.oom_preempted:
+            preempted_seq.status = SequenceStatus.WAITING
+            preempted_seq.is_prefill = True
+            preempted_seq.num_cached_tokens = 0
+            self.scheduler.block_manager.deallocate(preempted_seq)
+            self.scheduler.waiting.appendleft(preempted_seq)
+            if preempted_seq.seq_id in self.scheduler.running:
+                del self.scheduler.running[preempted_seq.seq_id]
+
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
         finished = [seq for seq in seqs if seq.is_finished]
-        # Clean up finished sequences
         for seq in finished:
             self.model_runner.free_deltanet_slot(seq.seq_id)
             self._all_seqs.pop(seq.seq_id, None)

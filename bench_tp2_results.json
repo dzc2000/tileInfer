@@ -1,0 +1,25 @@
+{
+  "model": "/mnt/models/Qwen3.6-27B",
+  "tp_size": 2,
+  "benchmarks": [
+    {
+      "method": "tileInfer_TP2",
+      "tp_size": 2,
+      "prompt_len": 8,
+      "max_new_tokens": 256,
+      "num_runs": 10,
+      "decode_tok_s": {
+        "mean": 37.4,
+        "median": 37.4,
+        "min": 37.3,
+        "max": 37.4
+      },
+      "mean_itl_ms": {
+        "mean": 26.75
+      },
+      "peak_vram_gb": {
+        "mean": 33.94
+      }
+    }
+  ]
+}

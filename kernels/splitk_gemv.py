@@ -242,7 +242,7 @@ def bf16_linear_forward(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tens
         return out.unsqueeze(0)
     else:
         if scale is not None:
-            w_bf16 = (weight.to(torch.float32) * scale.unsqueeze(1)).to(x.dtype)
+            w_bf16 = weight.to(x.dtype) * scale.unsqueeze(1).to(x.dtype)
             return torch.nn.functional.linear(x, w_bf16)
         return torch.nn.functional.linear(x, weight)
 

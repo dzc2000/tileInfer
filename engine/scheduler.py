@@ -4,7 +4,7 @@ Scheduler with Continuous Batching, Chunked Prefill, and Mixed Batching.
 Decides which sequences to run each step:
 - Mixed batching: decode + prefill sequences can coexist in one step
 - Chunked prefill: long prompts are split into chunks
-- SWAP preemption: swap out sequences to CPU under memory pressure (fallback to recompute)
+- RECOMPUTE preemption: release blocks and re-prefill under memory pressure
 """
 from collections import deque, OrderedDict
 from engine.config import Config
@@ -64,14 +64,11 @@ class Scheduler:
             while not self.block_manager.can_append(seq):
                 if preempted >= self.max_preempt_count:
                     break
-                # Try SWAP first, then RECOMPUTE
-                swapped = self._try_swap_or_preempt(seq, preempted)
-                if not swapped:
+                freed = self._try_preempt(seq)
+                if not freed:
                     break
                 preempted += 1
-                # After preemption, recheck
                 if not self.block_manager.can_append(seq):
-                    # Can't schedule this seq even after preemption
                     break
             else:
                 seq.num_scheduled_tokens = 1
@@ -132,51 +129,33 @@ class Scheduler:
         is_prefill = len(decode_seqs) == 0
         return scheduled, is_prefill
 
-    def _try_swap_or_preempt(self, seq: Sequence, preempt_count: int) -> bool:
-        """Try to free memory by swapping or preempting a running sequence.
+    def _try_preempt(self, seq: Sequence) -> bool:
+        """Try to free memory by preempting a running sequence (RECOMPUTE).
 
         Returns True if memory was freed, False otherwise.
-        Prefers SWAP (preserves state) over RECOMPUTE (loses state).
         """
         if not self.running:
-            # No other sequences to evict; preempt self
-            self._preempt_seq(seq, prefer_swap=True)
+            self._preempt_seq(seq)
             return True
 
-        # Evict the last-added running sequence (LIFO)
         preempt_id, preempt_seq = next(reversed(self.running.items()))
         del self.running[preempt_id]
-        self._preempt_seq(preempt_seq, prefer_swap=True)
+        self._preempt_seq(preempt_seq)
         return True
 
-    def _preempt_seq(self, seq: Sequence, prefer_swap: bool = True):
-        """Preempt a sequence: SWAP (if available) or RECOMPUTE."""
-        swapped = False
-        if prefer_swap and self.block_manager.num_free_swap_slots > 0:
-            swap_slot = self.block_manager.swap_out(seq)
-            if swap_slot >= 0:
-                seq.status = SequenceStatus.WAITING
-                seq.is_prefill = True
-                # Store swap slot for later restoration
-                seq._swap_slot = swap_slot
-                if self.on_preempt is not None:
-                    self.on_preempt(seq)
-                self.waiting.appendleft(seq)
-                swapped = True
-
-        if not swapped:
-            # RECOMPUTE: release all blocks, reset to waiting
-            seq.status = SequenceStatus.WAITING
-            seq.is_prefill = True
-            seq.num_cached_tokens = 0
-            self.block_manager.deallocate(seq)
-            if self.on_preempt is not None:
-                self.on_preempt(seq)
-            self.waiting.appendleft(seq)
+    def _preempt_seq(self, seq: Sequence):
+        """Preempt a sequence: release all blocks, reset to waiting for recompute."""
+        seq.status = SequenceStatus.WAITING
+        seq.is_prefill = True
+        seq.num_cached_tokens = 0
+        self.block_manager.deallocate(seq)
+        if self.on_preempt is not None:
+            self.on_preempt(seq)
+        self.waiting.appendleft(seq)
 
     def preempt(self, seq: Sequence):
         """Public preempt interface."""
-        self._preempt_seq(seq, prefer_swap=True)
+        self._preempt_seq(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         """Update sequences after a step: append tokens, check EOS/stop strings."""
