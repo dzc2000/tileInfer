@@ -10,6 +10,7 @@ Handles:
 - Sampling
 - Tensor Parallelism support
 """
+import bisect
 from collections import deque
 
 import torch
@@ -112,6 +113,18 @@ class ModelRunner:
         self.graph_pool = None
         self.padding_deltanet_slot = -1
         self.max_blocks_per_seq = (config.max_model_len // self.block_size) + 2
+        self._sorted_buckets: list[int] = []
+
+        # Pinned-memory tensors for decode (allocated in capture_decode_graphs)
+        self._pinned_input_ids = None
+        self._pinned_positions = None
+        self._pinned_slot_mapping = None
+        self._pinned_context_lens = None
+        self._pinned_deltanet_slots = None
+        self._pinned_block_tables = None
+
+        # Cache for chunked prefill gather indices: (seq_id, start) -> (block_table_copy, slot_mapping_tensor)
+        self._prefill_gather_cache: dict[tuple[int, int], tuple[list[int], torch.Tensor]] = {}
 
     def load_model(self):
         """Load Qwen3.6-27B model and apply tilelang kernels.
@@ -210,13 +223,16 @@ class ModelRunner:
         total_attn_block_bytes = block_bytes_per_attn_layer * self.num_attention_layers
 
         # DeltaNet state pools (TP-adjusted)
-        max_slots = config.max_num_seqs
+        # +1 extra slot reserved for CUDA Graph padding (padding_deltanet_slot)
+        max_slots = config.max_num_seqs + 1
         tp_conv_dim = self.tp_conv_dim
-        # NOTE: kernel_size is hardcoded to 4 (DeltaNet conv1d kernel size).
-        # conv1d weights are only available after model patching, so we cannot
-        # read it from the weight tensor here. Update if the model uses a
-        # different conv kernel size.
-        kernel_size = 4
+        # Read conv1d kernel size from hf_config (Qwen3.6 exposes it as
+        # conv_kernel_size). Fallback to 4 if not present.
+        kernel_size = getattr(self.hf_config, 'conv_kernel_size', None)
+        if kernel_size is None:
+            kernel_size = getattr(self.hf_config, 'ssm_conv_kernel', None)
+        if kernel_size is None:
+            kernel_size = 4
 
         deltanet_state_bytes = (
             max_slots * self.tp_num_v_heads * self.head_k_dim * self.head_v_dim * 2
@@ -257,10 +273,11 @@ class ModelRunner:
         self.free_deltanet_slots = deque(range(max_slots))
         self.seq_to_slot = {}
 
-        # Update max_blocks_per_seq to match the kernel's compile-time num_pages.
-        # gqa_decode_paged compiles block_table with shape [batch, num_blocks],
-        # so CUDA Graph static buffers must use the same width.
-        self.max_blocks_per_seq = num_blocks
+        # Clamp max_blocks_per_seq to the actual number of blocks available.
+        # __init__ sets it to (max_model_len // block_size) + 2 for correctness,
+        # but when GPU memory is scarce (few blocks), the static block_table
+        # must not exceed the actual cache size.
+        self.max_blocks_per_seq = min(self.max_blocks_per_seq, num_blocks)
 
         # Register with model module
         from model.qwen_36 import set_paged_kv_cache, set_deltanet_pools
@@ -285,12 +302,16 @@ class ModelRunner:
         return slot
 
     def free_deltanet_slot(self, seq_id: int):
-        """Free a DeltaNet state slot."""
+        """Free a DeltaNet state slot and invalidate prefill gather cache for this seq."""
         slot = self.seq_to_slot.pop(seq_id, None)
         if slot is not None:
             self.deltanet_recurrent_pool[:, slot].zero_()
             self.deltanet_conv_pool[:, slot].zero_()
             self.free_deltanet_slots.append(slot)
+        # Invalidate any cached prefill gather indices (block_table may change after preemption).
+        keys_to_remove = [k for k in self._prefill_gather_cache if k[0] == seq_id]
+        for k in keys_to_remove:
+            del self._prefill_gather_cache[k]
 
     @torch.inference_mode()
     def _decode_forward_logits(self, input_ids: torch.Tensor, positions: torch.Tensor,
@@ -366,8 +387,8 @@ class ModelRunner:
         if not buckets:
             return
 
-        # Reserve a dummy DeltaNet slot for padded rows (deterministic across ranks).
-        self.padding_deltanet_slot = self.config.max_num_seqs - 1
+        # Reserve the last slot for CUDA Graph padding (deterministic across ranks).
+        self.padding_deltanet_slot = self.config.max_num_seqs
         try:
             self.free_deltanet_slots.remove(self.padding_deltanet_slot)
         except ValueError:
@@ -416,13 +437,29 @@ class ModelRunner:
             runner.graph = g
             self.cuda_graphs[bsz] = runner
 
+        # Pre-sort bucket sizes for O(log n) bisect_left lookup in _select_bucket.
+        self._sorted_buckets = sorted(self.cuda_graphs)
+
+        # Pre-allocate CPU pinned-memory tensors reused every decode step to
+        # avoid per-step Python list + torch.tensor allocations in
+        # _prepare_decode_into_graph. Sized to the largest captured bucket.
+        max_bsz = buckets[-1]
+        self._pinned_input_ids = torch.empty(max_bsz, dtype=torch.int64, pin_memory=True)
+        self._pinned_positions = torch.empty(max_bsz, dtype=torch.int64, pin_memory=True)
+        self._pinned_slot_mapping = torch.empty(max_bsz, dtype=torch.int32, pin_memory=True)
+        self._pinned_context_lens = torch.empty(max_bsz, dtype=torch.int32, pin_memory=True)
+        self._pinned_deltanet_slots = torch.empty(max_bsz, dtype=torch.int32, pin_memory=True)
+        self._pinned_block_tables = torch.empty(
+            max_bsz, max_blocks, dtype=torch.int32, pin_memory=True)
+
         print(f"[Rank {self.tp_rank}] Captured CUDA graphs for decode batch sizes: {buckets}")
 
     def _select_bucket(self, n: int) -> int | None:
         """Smallest captured batch size >= n, or None if n exceeds all buckets."""
-        for b in sorted(self.cuda_graphs):
-            if b >= n:
-                return b
+        buckets = self._sorted_buckets
+        idx = bisect.bisect_left(buckets, n)
+        if idx < len(buckets):
+            return buckets[idx]
         return None
 
     def _run_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor,
@@ -459,44 +496,43 @@ class ModelRunner:
         """Prepare decode inputs directly into CUDA graph static buffers.
 
         Avoids creating intermediate GPU tensors and the subsequent D2D copy.
-        Uses pinned-memory CPU tensors for async H2D transfer where possible.
+        Reuses pre-allocated pinned-memory CPU tensors for async H2D transfer.
         """
         bsz = runner.batch_size
         block_size = self.block_size
 
-        input_ids_cpu = [0] * n
-        positions_cpu = [0] * n
-        context_lens_cpu = [0] * n
-        slot_mapping_cpu = [0] * n
-        deltanet_slots_cpu = [0] * n
+        # Reuse pre-allocated pinned tensors (no per-step allocation).
+        pids = self._pinned_input_ids
+        ppos = self._pinned_positions
+        pslots = self._pinned_slot_mapping
+        pctx = self._pinned_context_lens
+        pdn = self._pinned_deltanet_slots
+        pbt = self._pinned_block_tables
 
         for i, seq in enumerate(seqs):
-            input_ids_cpu[i] = seq.last_token
+            pids[i] = seq.last_token
             pos = seq.num_tokens - 1
-            positions_cpu[i] = pos
-            context_lens_cpu[i] = seq.num_tokens
+            ppos[i] = pos
+            pctx[i] = seq.num_tokens
             block_idx = pos // block_size
             block_offset = pos % block_size
             physical_block = seq.block_table[block_idx]
-            slot_mapping_cpu[i] = physical_block * block_size + block_offset
-            deltanet_slots_cpu[i] = self.seq_to_slot[seq.seq_id]
-
-        runner.static_input_ids[:n].copy_(
-            torch.tensor(input_ids_cpu, dtype=torch.int64), non_blocking=True)
-        runner.static_positions[:n].copy_(
-            torch.tensor(positions_cpu, dtype=torch.int64), non_blocking=True)
-        runner.static_slot_mapping[:n].copy_(
-            torch.tensor(slot_mapping_cpu, dtype=torch.int32), non_blocking=True)
-        runner.static_context_lens[:n].copy_(
-            torch.tensor(context_lens_cpu, dtype=torch.int32), non_blocking=True)
-        runner.static_deltanet_slots[:n].copy_(
-            torch.tensor(deltanet_slots_cpu, dtype=torch.int32), non_blocking=True)
-
-        runner.static_block_tables[:n].fill_(-1)
-        for i, seq in enumerate(seqs):
+            pslots[i] = physical_block * block_size + block_offset
+            pdn[i] = self.seq_to_slot[seq.seq_id]
             bt_len = len(seq.block_table)
-            runner.static_block_tables[i, :bt_len].copy_(
-                torch.tensor(seq.block_table, dtype=torch.int32), non_blocking=True)
+            pbt[i, :bt_len] = torch.tensor(seq.block_table, dtype=torch.int32)
+            pbt[i, bt_len:].fill_(-1)
+
+        # Fill padding rows in pinned block_tables (only rows that will be copied).
+        if n < bsz:
+            pbt[n:bsz].fill_(-1)
+
+        runner.static_input_ids[:n].copy_(pids[:n], non_blocking=True)
+        runner.static_positions[:n].copy_(ppos[:n], non_blocking=True)
+        runner.static_slot_mapping[:n].copy_(pslots[:n], non_blocking=True)
+        runner.static_context_lens[:n].copy_(pctx[:n], non_blocking=True)
+        runner.static_deltanet_slots[:n].copy_(pdn[:n], non_blocking=True)
+        runner.static_block_tables.copy_(pbt[:bsz], non_blocking=True)
 
         if n < bsz:
             runner.static_slot_mapping[n:].fill_(-1)
@@ -514,20 +550,37 @@ class ModelRunner:
         return torch.tensor(tables, dtype=torch.int32, device="cuda")
 
     def _build_slot_mapping_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        """Build slot_mapping for prefill: maps each token position to its physical slot in KV cache."""
+        """Build slot_mapping for prefill: maps each token position to its physical slot in KV cache.
+
+        Caches per-(seq_id, start) so that re-prefill of the same chunk (e.g. after
+        preemption with the same block_table) reuses the precomputed tensor.
+        """
         slot_mapping = []
         for seq in seqs:
             start = seq.num_cached_tokens
             end = start + seq.num_scheduled_tokens
+            cache_key = (seq.seq_id, start)
+            cached = self._prefill_gather_cache.get(cache_key)
+            if cached is not None and cached[0] == seq.block_table:
+                # Block table unchanged — reuse cached gather indices.
+                slot_mapping.append(cached[1])
+                continue
+
+            # Rebuild gather indices for this chunk.
+            chunk_slots = []
             for pos in range(start, end):
                 block_idx = pos // self.block_size
                 block_offset = pos % self.block_size
                 if block_idx < len(seq.block_table):
                     physical_block = seq.block_table[block_idx]
-                    slot_mapping.append(physical_block * self.block_size + block_offset)
+                    chunk_slots.append(physical_block * self.block_size + block_offset)
                 else:
-                    slot_mapping.append(-1)  # shouldn't happen
-        return torch.tensor(slot_mapping, dtype=torch.int32, device="cuda")
+                    chunk_slots.append(-1)  # shouldn't happen
+            chunk_tensor = torch.tensor(chunk_slots, dtype=torch.int32, device="cuda")
+            self._prefill_gather_cache[cache_key] = (list(seq.block_table), chunk_tensor)
+            slot_mapping.append(chunk_tensor)
+
+        return torch.cat(slot_mapping) if len(slot_mapping) > 1 else slot_mapping[0]
 
     def _build_slot_mapping_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         """Build slot_mapping for decode: one slot per sequence (the new token)."""
@@ -629,7 +682,33 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        """Execute one step: prepare inputs, run model, sample tokens."""
+        """Execute one step: prepare inputs, run model, sample tokens.
+
+        Wraps _run_impl with CUDA OOM recovery: on OutOfMemoryError, clears the
+        CUDA cache, preempts the last-added sequence to reduce batch size, and
+        retries. After max_retries failed attempts, raises a clear error.
+        """
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                return self._run_impl(seqs, is_prefill)
+            except torch.cuda.OutOfMemoryError:
+                if attempt >= max_retries:
+                    raise RuntimeError(
+                        f"CUDA OOM after {max_retries} retries with "
+                        f"batch_size={len(seqs)}, is_prefill={is_prefill}. "
+                        f"Try reducing max_num_seqs, max_model_len, or "
+                        f"max_prefill_chunk_tokens."
+                    ) from None
+                # Clear fragmented cache and preempt the last sequence.
+                torch.cuda.empty_cache()
+                if len(seqs) > 1:
+                    preempted = seqs.pop()
+                    self.free_deltanet_slot(preempted.seq_id)
+                # Retry with reduced batch (or same batch after cache clear).
+
+    def _run_impl(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        """Core execution logic for one step (without OOM handling)."""
         # Allocate DeltaNet slots for new sequences
         for seq in seqs:
             if seq.seq_id not in self.seq_to_slot:
@@ -654,6 +733,10 @@ class ModelRunner:
             if bsz is not None:
                 runner = self.cuda_graphs[bsz]
                 self._prepare_decode_into_graph(seqs, runner, n)
+                # Restore the decode context that was active during graph capture.
+                # The prefill step may have left a stale context with context_lens=None;
+                # without this, gqa_decode_paged_fn gets seqlen_kv=None.
+                set_context(runner.ctx)
                 runner.graph.replay()
                 logits = runner.static_logits[:n]
                 token_ids = self._sample_decode(logits, seqs)
@@ -727,7 +810,10 @@ class ModelRunner:
                     token_ids = self._sample_prefill_fused(hidden, seqs)
                 else:
                     all_greedy = all(seq.temperature < 1e-6 for seq in seqs)
-                    if all_greedy:
+                    has_rep_penalty = any(seq.repetition_penalty > 1.0 for seq in seqs)
+                    # Fused greedy argmax can't apply repetition penalty; fall back
+                    # to materialized logits when penalty is active.
+                    if all_greedy and not has_rep_penalty:
                         token_ids = self._decode_greedy_fused(hidden, seqs)
                     else:
                         logits = self.model.lm_head(hidden)
@@ -782,10 +868,50 @@ class ModelRunner:
 
         return token_ids
 
+    def _apply_repetition_penalty(self, logits: torch.Tensor, seqs: list[Sequence]):
+        """Apply repetition penalty to logits in-place before sampling.
+
+        For tokens that appeared in the sequence's context:
+            logit = logit / repetition_penalty   if logit > 0
+            logit = logit * repetition_penalty   if logit <= 0
+
+        Works on both full-vocab logits and sharded logits (TP). When sharded,
+        each rank only penalizes tokens within its vocab shard.
+        """
+        if not any(seq.repetition_penalty > 1.0 for seq in seqs):
+            return
+
+        is_2d = logits.dim() == 2
+        vocab_shard = logits.shape[-1]
+        vocab_offset = self.tp_rank * vocab_shard if self.tp_size > 1 else 0
+
+        for i, seq in enumerate(seqs):
+            if seq.repetition_penalty <= 1.0:
+                continue
+            logits_i = logits[i] if is_2d else logits
+            appeared = set(seq.token_ids)
+            local_indices = [
+                t - vocab_offset for t in appeared
+                if 0 <= t - vocab_offset < vocab_shard
+            ]
+            if not local_indices:
+                continue
+            idx_tensor = torch.tensor(local_indices, dtype=torch.int64, device=logits_i.device)
+            gathered = logits_i[idx_tensor]
+            penalized = torch.where(
+                gathered > 0,
+                gathered / seq.repetition_penalty,
+                gathered * seq.repetition_penalty,
+            )
+            logits_i[idx_tensor] = penalized
+
     def _sample_decode(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
         """Optimized decode sampling: uses distributed argmax for greedy, avoids .item() syncs."""
         if logits.dim() == 3:
             logits = logits.squeeze(1)
+
+        # Apply repetition penalty before any sampling/argmax.
+        self._apply_repetition_penalty(logits, seqs)
 
         all_greedy = all(seq.temperature < 1e-6 for seq in seqs)
 
@@ -796,8 +922,9 @@ class ModelRunner:
                 token_tensor = logits.argmax(dim=-1)
             return token_tensor.tolist()
 
+        # Non-greedy: use distributed top-k to avoid all-gathering full logits.
         if self.tp_size > 1:
-            logits = self._all_gather_logits(logits.unsqueeze(1)).squeeze(1)
+            return self._distributed_sample_topk(logits, seqs)
 
         token_ids = []
         for i, seq in enumerate(seqs):
@@ -809,6 +936,79 @@ class ModelRunner:
                 probs = torch.softmax(scaled, dim=-1)
                 probs = self._apply_top_k_top_p(probs, seq.top_k, seq.top_p)
                 token_ids.append(torch.multinomial(probs, 1).item())
+        return token_ids
+
+    def _distributed_sample_topk(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
+        """Distributed non-greedy sampling via top-k to reduce communication.
+
+        Instead of All-Gathering full logits (vocab_size * bf16 per rank), each
+        rank computes local top-k logits + indices, All-Gathers only the small
+        (k * tp_size) candidate set, finds the global top-k, then samples.
+
+        Communication drops from O(vocab_size) to O(k * tp_size).
+        """
+        import torch.distributed as dist
+        from engine.parallel import get_tp_group
+
+        bsz = logits.shape[0]
+        vocab_shard = logits.shape[1]
+
+        # Choose k large enough for all sequences' top_k / top_p.
+        k = max((seq.top_k for seq in seqs if seq.top_k > 0), default=20)
+        if any(seq.top_p < 1.0 and seq.top_k <= 0 for seq in seqs):
+            k = max(k, 50)
+        k = min(k, vocab_shard)
+
+        # Local top-k.
+        local_vals, local_idx = logits.topk(k, dim=-1)
+        # Convert local indices to global token IDs.
+        vocab_offset = self.tp_rank * vocab_shard
+        local_idx = local_idx + vocab_offset
+
+        # All-Gather top-k (vals, idx) — tiny compared to full logits.
+        all_vals = [torch.empty_like(local_vals) for _ in range(self.tp_size)]
+        all_idx = [torch.empty_like(local_idx) for _ in range(self.tp_size)]
+        dist.all_gather(all_vals, local_vals, group=get_tp_group())
+        dist.all_gather(all_idx, local_idx, group=get_tp_group())
+
+        gathered_vals = torch.cat(all_vals, dim=-1)   # [bsz, k * tp]
+        gathered_idx = torch.cat(all_idx, dim=-1)     # [bsz, k * tp]
+
+        # Global top-k from the gathered candidate set.
+        global_vals, topk_pos = gathered_vals.topk(k, dim=-1)
+        global_idx = gathered_idx.gather(1, topk_pos)
+
+        token_ids = []
+        for i, seq in enumerate(seqs):
+            vals_i = global_vals[i]
+            idx_i = global_idx[i]
+
+            if seq.temperature < 1e-6:
+                token_ids.append(idx_i[vals_i.argmax()].item())
+                continue
+
+            scaled = vals_i / seq.temperature
+            probs = torch.softmax(scaled, dim=-1)
+
+            # Further truncate to seq.top_k if specified and smaller than k.
+            if seq.top_k > 0 and seq.top_k < probs.numel():
+                tk_vals, tk_pos = torch.topk(probs, seq.top_k)
+                probs = torch.zeros_like(probs)
+                probs[tk_pos] = tk_vals
+
+            # Apply top-p on the candidate set.
+            if seq.top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumsum = torch.cumsum(sorted_probs, dim=0)
+                mask = cumsum - sorted_probs > seq.top_p
+                sorted_probs[mask] = 0
+                sorted_probs /= sorted_probs.sum()
+                probs = torch.zeros_like(probs)
+                probs[sorted_indices] = sorted_probs
+
+            sampled = torch.multinomial(probs, 1)
+            token_ids.append(idx_i[sampled].item())
+
         return token_ids
 
     def _decode_greedy_fused(self, hidden: torch.Tensor, seqs: list[Sequence]) -> list[int]:
@@ -832,13 +1032,17 @@ class ModelRunner:
     def _sample_prefill_fused(self, hidden: torch.Tensor, seqs: list[Sequence]) -> list[int]:
         """Fused lm_head + argmax for prefill (non-CUDA Graph path).
 
-        For greedy: uses 1D fused kernel on the last token's hidden state.
-        For sampling: falls back to full logits materialization.
+        For greedy without repetition penalty: uses 1D fused kernel on the last
+        token's hidden state.
+        For sampling or when repetition penalty is active: falls back to full
+        logits materialization.
         """
         seq = seqs[0]
         last_hidden = hidden[0, -1, :]
+        has_rep_penalty = seq.repetition_penalty > 1.0
 
-        if seq.temperature < 1e-6:
+        # Fast path: greedy without repetition penalty can use fused argmax.
+        if seq.temperature < 1e-6 and not has_rep_penalty:
             if self.tp_size > 1:
                 local_idx, local_max = fused_lm_head_argmax_with_max(
                     last_hidden.unsqueeze(0), self.model.lm_head.weight)
@@ -849,10 +1053,19 @@ class ModelRunner:
                 token_tensor = fused_lm_head_argmax(last_hidden, self.model.lm_head.weight)
                 return [token_tensor[0].item()]
 
+        # Materialize logits (needed for sampling or repetition penalty).
         logits = self.model.lm_head(hidden)
         if self.tp_size > 1:
             logits = self._all_gather_logits(logits)
         last_logits = logits[0, -1, :]
+
+        # Apply repetition penalty on the last token's logits.
+        if has_rep_penalty:
+            self._apply_repetition_penalty(last_logits.unsqueeze(0), [seq])
+
+        if seq.temperature < 1e-6:
+            return [last_logits.argmax().item()]
+
         scaled = last_logits / seq.temperature
         probs = torch.softmax(scaled, dim=-1)
         probs = self._apply_top_k_top_p(probs, seq.top_k, seq.top_p)

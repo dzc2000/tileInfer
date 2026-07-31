@@ -14,21 +14,24 @@ class Config:
     # Scheduling
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 64
-    max_model_len: int = 4096
+    max_model_len: int = 32768
     # Memory
     gpu_memory_utilization: float = 0.9
     kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1  # auto-computed
+    swap_space_bytes: int = 0  # CPU offload for SWAP preemption (0 = disabled)
     # Model
     enforce_eager: bool = False
     # CUDA Graph: max decode batch size captured (powers-of-two buckets up to this)
     cuda_graph_max_batch_size: int = 256
     hf_config: object = None
-    eos: int = 151645  # Qwen3.6 EOS token
+    eos: list = None  # populated from hf_config in __post_init__
     # Chunked prefill
     max_prefill_chunk_tokens: int = 4096
     # Tensor parallelism
     tp_size: int = 1
+    # NCCL
+    nccl_timeout: float = 600.0  # seconds
 
     def __post_init__(self):
         from transformers import AutoConfig
@@ -39,7 +42,12 @@ class Config:
             self.hf_config = self.hf_config.text_config
         max_pos = getattr(self.hf_config, 'max_position_embeddings', 32768)
         self.max_model_len = min(self.max_model_len, max_pos)
-        self.eos = getattr(self.hf_config, 'eos_token_id', self.eos)
+        # Support multiple EOS tokens (Qwen3.6 has <|im_end|>, <|endoftext|>, etc.)
+        eos_id = getattr(self.hf_config, 'eos_token_id', 151645)
+        if isinstance(eos_id, list):
+            self.eos = eos_id
+        else:
+            self.eos = [eos_id]
         self._validate_tp_size()
 
     def _validate_tp_size(self):

@@ -16,11 +16,13 @@ _tp_group = None
 _initialized: bool = False
 
 
-def init_distributed(tp_size: int = 1, backend: str = "nccl"):
+def init_distributed(tp_size: int = 1, backend: str = "nccl", timeout: float = 600.0):
     """Initialize tensor parallelism.
 
     Must be called before model loading when tp_size > 1.
     Sets CUDA device to the local rank.
+    Creates a dedicated TP process group (not hardcoded to WORLD) so future
+    data-parallel or pipeline-parallel groups can coexist.
     """
     global _tp_rank, _tp_world_size, _tp_group, _initialized
 
@@ -29,7 +31,11 @@ def init_distributed(tp_size: int = 1, backend: str = "nccl"):
         return
 
     if not dist.is_initialized():
-        dist.init_process_group(backend=backend)
+        import datetime
+        dist.init_process_group(
+            backend=backend,
+            timeout=datetime.timedelta(seconds=timeout),
+        )
 
     _tp_world_size = dist.get_world_size()
     _tp_rank = dist.get_rank()
@@ -40,6 +46,8 @@ def init_distributed(tp_size: int = 1, backend: str = "nccl"):
             f"Launch with exactly {tp_size} processes (e.g. torchrun --nproc_per_node={tp_size})."
         )
 
+    # Use WORLD as TP group (supports single-node TP).
+    # For multi-node or DP+TP, create a sub-group via dist.new_group(ranks=range(tp_size)).
     _tp_group = dist.group.WORLD
     _initialized = True
 

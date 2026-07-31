@@ -32,6 +32,10 @@ import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+os.environ.setdefault(
+    "TILELANG_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".tilelang_cache"),
+)
 
 import torch
 
@@ -58,11 +62,22 @@ def bench_tileinfer_tp(model_path: str, tp_size: int, prompt: str,
         _ = llm.generate([prompt], params)
 
     # Timed runs
+    prefill_params = SamplingParams(temperature=0.0, max_tokens=1)
     all_timings = []
     for run in range(num_runs):
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
 
+        # Measure prefill separately (max_tokens=1)
+        p_start = torch.cuda.Event(enable_timing=True)
+        p_end = torch.cuda.Event(enable_timing=True)
+        p_start.record()
+        _ = llm.generate([prompt], prefill_params)
+        p_end.record()
+        torch.cuda.synchronize()
+        prefill_ms = p_start.elapsed_time(p_end)
+
+        # Measure full generate (prefill + decode)
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -76,17 +91,19 @@ def bench_tileinfer_tp(model_path: str, tp_size: int, prompt: str,
         completion_tokens = len(outputs[0]["token_ids"])
         prompt_len = len(outputs[0]["prompt_token_ids"])
 
-        # Estimate decode time
-        prefill_ms = prompt_len * 0.02
-        decode_ms = total_ms - prefill_ms
-        decode_tok_s = completion_tokens / decode_ms * 1000 if decode_ms > 0 else 0
-        mean_itl_ms = decode_ms / completion_tokens if completion_tokens > 0 else 0
+        # decode_ms = total - prefill; decode_tokens excludes the first token
+        # already produced during the prefill-only run
+        decode_ms = max(total_ms - prefill_ms, 0.0)
+        decode_tokens = max(completion_tokens - 1, 1)
+        decode_tok_s = decode_tokens / decode_ms * 1000 if decode_ms > 0 else 0
+        mean_itl_ms = decode_ms / decode_tokens if decode_tokens > 0 else 0
         peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
 
         timing = {
+            "prefill_ms": round(prefill_ms, 2),
             "total_ms": round(total_ms, 2),
             "decode_ms": round(decode_ms, 2),
-            "decode_tokens": completion_tokens,
+            "decode_tokens": decode_tokens,
             "decode_tok_s": round(decode_tok_s, 1),
             "mean_itl_ms": round(mean_itl_ms, 2),
             "peak_vram_gb": round(peak_vram, 2),

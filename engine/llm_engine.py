@@ -2,8 +2,8 @@
 LLMEngine: main orchestrator for Qwen3.6-27B inference.
 
 Coordinates Scheduler, BlockManager, and ModelRunner to process
-batches of requests with continuous batching and chunked prefill.
-Supports Tensor Parallelism for multi-GPU inference.
+batches of requests with continuous batching, chunked prefill,
+and mixed batching. Supports Tensor Parallelism for multi-GPU inference.
 
 Usage:
     from engine.llm_engine import LLMEngine
@@ -12,6 +12,10 @@ Usage:
     engine = LLMEngine("/path/to/Qwen3.6-27B")
     params = SamplingParams(temperature=0.6, max_tokens=256)
     outputs = engine.generate(["Hello, world!"], params)
+
+Streaming:
+    for token in engine.generate_stream(["Hello"], params):
+        print(token, end="", flush=True)
 """
 import torch
 from transformers import AutoTokenizer
@@ -28,7 +32,7 @@ class LLMEngine:
         self.config = Config(model=model, **kwargs)
 
         # Initialize TP (must be done before model loading)
-        init_distributed(self.config.tp_size)
+        init_distributed(self.config.tp_size, timeout=self.config.nccl_timeout)
 
         self.tokenizer = AutoTokenizer.from_pretrained(model)
 
@@ -49,12 +53,12 @@ class LLMEngine:
         self.model_runner.capture_decode_graphs()
         barrier()
 
-        # Initialize scheduler (deterministic, same on all ranks)
-        self.scheduler = Scheduler(self.config)
+        # Initialize scheduler with tokenizer (for stop string checks)
+        self.scheduler = Scheduler(self.config, tokenizer=self.tokenizer)
         self.scheduler.on_preempt = lambda seq: self.model_runner.free_deltanet_slot(seq.seq_id)
 
-        # Track all sequences for result collection
-        self._all_seqs: list[Sequence] = []
+        # Track all sequences for result collection and cleanup
+        self._all_seqs: dict[int, Sequence] = {}
 
     def _warmup(self):
         """Warmup model: trigger tilelang JIT compilation and measure peak memory."""
@@ -129,18 +133,35 @@ class LLMEngine:
         if sampling_params is None:
             sampling_params = SamplingParams()
         token_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
+
+        # Validate prompt length
+        max_len = self.config.max_model_len
+        if len(token_ids) > max_len:
+            raise ValueError(
+                f"Prompt has {len(token_ids)} tokens, exceeds max_model_len={max_len}. "
+                f"Truncate the prompt or increase max_model_len."
+            )
+        if len(token_ids) == 0:
+            raise ValueError("Prompt produced no tokens after tokenization")
+
         seq = Sequence(token_ids, sampling_params)
         self.scheduler.add(seq)
-        self._all_seqs.append(seq)
+        self._all_seqs[seq.seq_id] = seq
         return seq
 
     def step(self) -> list[Sequence]:
         """Run one scheduling step. Returns list of sequences that finished this step."""
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            return []
         token_ids = self.model_runner.run(seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
         finished = [seq for seq in seqs if seq.is_finished]
+        # Clean up finished sequences
+        for seq in finished:
+            self.model_runner.free_deltanet_slot(seq.seq_id)
+            self._all_seqs.pop(seq.seq_id, None)
         return finished
 
     def generate(
@@ -164,9 +185,7 @@ class LLMEngine:
             while not self.scheduler.is_finished():
                 self.step()
         finally:
-            for seq in seqs:
-                self.model_runner.free_deltanet_slot(seq.seq_id)
-            self._all_seqs.clear()
+            self._cleanup_seqs(seqs)
 
         outputs = []
         for seq in seqs:
@@ -180,6 +199,53 @@ class LLMEngine:
             })
 
         return outputs
+
+    def generate_stream(
+        self,
+        prompts: list[str],
+        sampling_params: SamplingParams | None = None,
+    ):
+        """Generate completions with streaming output.
+
+        Yields (seq_index, token_text, is_finished) for each token generated.
+        """
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+
+        seqs = []
+        for prompt in prompts:
+            seq = self.add_request(prompt, sampling_params)
+            seqs.append(seq)
+
+        # Track which tokens have been yielded per sequence
+        yielded_count = [0] * len(seqs)
+
+        try:
+            while not self.scheduler.is_finished():
+                finished_seqs = self.step()
+
+                # Yield newly generated tokens
+                for i, seq in enumerate(seqs):
+                    if seq.is_finished:
+                        continue
+                    new_count = len(seq.completion_token_ids)
+                    while yielded_count[i] < new_count:
+                        token_id = seq.completion_token_ids[yielded_count[i]]
+                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                        yielded_count[i] += 1
+                        yield (i, token_text, False)
+
+                # Yield final token for finished sequences
+                for seq in finished_seqs:
+                    i = seqs.index(seq)
+                    new_count = len(seq.completion_token_ids)
+                    while yielded_count[i] < new_count:
+                        token_id = seq.completion_token_ids[yielded_count[i]]
+                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
+                        yielded_count[i] += 1
+                        yield (i, token_text, True)
+        finally:
+            self._cleanup_seqs(seqs)
 
     def generate_token_ids(
         self,
@@ -199,8 +265,12 @@ class LLMEngine:
             while not self.scheduler.is_finished():
                 self.step()
         finally:
-            for seq in seqs:
-                self.model_runner.free_deltanet_slot(seq.seq_id)
-            self._all_seqs.clear()
+            self._cleanup_seqs(seqs)
 
         return [seq.completion_token_ids for seq in seqs]
+
+    def _cleanup_seqs(self, seqs: list[Sequence]):
+        """Clean up all sequences: free DeltaNet slots and remove from tracking."""
+        for seq in seqs:
+            self.model_runner.free_deltanet_slot(seq.seq_id)
+            self._all_seqs.pop(seq.seq_id, None)

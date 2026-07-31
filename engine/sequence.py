@@ -38,6 +38,12 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.top_p = sampling_params.top_p
         self.top_k = sampling_params.top_k
+        self.repetition_penalty = sampling_params.repetition_penalty
+        self.stop = sampling_params.stop
+
+        # Prompt length validation
+        if self.num_tokens == 0:
+            raise ValueError("Prompt must contain at least one token")
 
         # DeltaNet recurrent state index (slot in paged recurrent state pool)
         self.deltanet_state_slot = -1
@@ -87,7 +93,7 @@ class Sequence:
             self.num_cached_tokens, self.num_scheduled_tokens, self.block_table,
             self.token_ids, self.last_token, self.is_prefill, self.temperature,
             self.max_tokens, self.ignore_eos, self.top_p, self.top_k,
-            self.deltanet_state_slot,
+            self.deltanet_state_slot, self.repetition_penalty, self.stop,
         )
 
     def __setstate__(self, state):
@@ -95,4 +101,4 @@ class Sequence:
          self.num_cached_tokens, self.num_scheduled_tokens, self.block_table,
          self.token_ids, self.last_token, self.is_prefill, self.temperature,
          self.max_tokens, self.ignore_eos, self.top_p, self.top_k,
-         self.deltanet_state_slot) = state
+         self.deltanet_state_slot, self.repetition_penalty, self.stop) = state
