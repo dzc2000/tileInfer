@@ -12,6 +12,13 @@ class SamplingParams:
     repetition_penalty: float = 1.0  # 1.0 = no penalty
     stop: list = field(default_factory=list)  # stop strings (generation halts when any is matched)
     n: int = 1  # number of completions to generate per prompt
+    # --- Constrained decoding (约束解码) ---
+    logit_bias: dict = field(default_factory=dict)  # token_id -> additive logit bias
+    allowed_token_ids: list = field(default_factory=list)  # hard allow-list
+    bad_token_ids: list = field(default_factory=list)  # hard deny-list
+    guided_choice: list = field(default_factory=list)  # restrict output to one of these strings
+    guided_json: object = None  # force valid JSON (True/dict -> JSON mode, dict = schema)
+    guided_regex: str = None  # force output to match this regular expression
 
     def __post_init__(self):
         if self.temperature < 0:

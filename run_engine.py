@@ -37,6 +37,16 @@ def main():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallelism size (number of GPUs)")
+    parser.add_argument("--num-scheduler-steps", type=int, default=1,
+                        help="Multi-step scheduling: decode steps per scheduler invocation (1 = disabled)")
+    parser.add_argument("--no-prefix-caching", action="store_true",
+                        help="Disable prefix caching")
+    parser.add_argument("--guided-json", action="store_true",
+                        help="Constrain output to valid JSON")
+    parser.add_argument("--guided-regex", type=str, default=None,
+                        help="Constrain output to match a regular expression")
+    parser.add_argument("--guided-choice", type=str, default=None,
+                        help="Comma-separated choices to constrain output to one of")
     args = parser.parse_args()
 
     # Initialize engine
@@ -48,6 +58,8 @@ def main():
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         tp_size=args.tp_size,
+        num_scheduler_steps=args.num_scheduler_steps,
+        enable_prefix_caching=not args.no_prefix_caching,
     )
 
     # Set sampling params
@@ -56,6 +68,10 @@ def main():
         top_p=args.top_p,
         top_k=args.top_k,
         max_tokens=args.max_tokens,
+        guided_json=True if args.guided_json else None,
+        guided_regex=args.guided_regex,
+        guided_choice=(args.guided_choice.split(",")
+                       if args.guided_choice else []),
     )
 
     # Generate (only rank 0 prints results)

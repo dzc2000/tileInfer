@@ -13,6 +13,9 @@ A high-performance inference engine for **Qwen3.6-27B**, built on custom TileLan
 | **Paged KV Cache** | Block-based KV cache management with SWAP preemption |
 | **Continuous Batching** | Dynamic batching with iterative scheduler (no recursion) |
 | **Chunked Prefill** | Split long prefill sequences into chunks to avoid memory spikes |
+| **Prefix Caching** | Reuse KV-cache blocks + DeltaNet recurrent state across requests sharing a token prefix |
+| **Constrained Decoding** | `logit_bias`, allow/deny token lists, guided choice / JSON / regex |
+| **Multi-Step Scheduling** | Run several decode steps per scheduler invocation to amortize Python overhead |
 | **Tensor Parallelism** | Multi-GPU inference via column/row parallel weight sharding and All-Reduce |
 | **CUDA Graph** | Decode step capture for minimal kernel launch overhead |
 | **Streaming API** | `generate_stream()` for token-by-token output |
@@ -207,8 +210,56 @@ llm = LLM(
     max_model_len=32768,        # Max sequence length
     gpu_memory_utilization=0.9, # GPU memory fraction for KV cache
     enforce_eager=False,        # Set True to disable CUDA graph (debugging)
+    enable_prefix_caching=True, # Reuse KV/DeltaNet state across shared prefixes
+    num_scheduler_steps=1,      # Decode steps per scheduler invocation (multi-step)
 )
 ```
+
+## Prefix Caching / Constrained Decoding / Multi-Step Scheduling
+
+```python
+from engine.llm import LLM
+from engine.sampling_params import SamplingParams
+
+llm = LLM(model="/path/to/Qwen3.6-27B", enable_prefix_caching=True,
+          num_scheduler_steps=8)
+
+# Prefix caching: requests sharing a token prefix (e.g. a system prompt) reuse
+# cached KV blocks and DeltaNet recurrent state instead of re-prefilling.
+for prompt in ["<system>...</system> question A",
+               "<system>...</system> question B"]:
+    print(llm.generate([prompt], SamplingParams(max_tokens=64))[0]["text"])
+
+# Constrained decoding — guided JSON (valid JSON output only).
+json_out = llm.generate(
+    ["Return a JSON object"],
+    SamplingParams(max_tokens=128, guided_json=True),
+)[0]["text"]
+
+# Guided choice.
+choice_out = llm.generate(
+    ["Classify the sentiment"],
+    SamplingParams(max_tokens=8, guided_choice=["positive", "negative"]),
+)[0]["text"]
+
+# Guided regex (supported subset: literals, classes, quantifiers, alternation).
+regex_out = llm.generate(
+    ["Write a phone number"],
+    SamplingParams(max_tokens=16, guided_regex=r"\d{3}-\d{4}"),
+)[0]["text"]
+
+# logit_bias / allowed / denied token ids.
+bias_out = llm.generate(
+    ["Hello"],
+    SamplingParams(max_tokens=64, logit_bias={1234: 5.0},
+                   bad_token_ids=[151645]),
+)[0]["text"]
+```
+
+The OpenAI-compatible server exposes the same knobs via request fields
+(`guided_json`, `guided_regex`, `guided_choice`, `logit_bias`,
+`allowed_token_ids`, `bad_token_ids`) and maps
+`response_format: {"type": "json_object"}` to JSON mode automatically.
 
 ## Tensor Parallelism
 

@@ -48,6 +48,14 @@ class Sequence:
         # DeltaNet recurrent state index (slot in paged recurrent state pool)
         self.deltanet_state_slot = -1
 
+        # Constrained decoding state (see engine/constraints.py)
+        self.constraint = None          # Constraint object built from sampling_params
+        self.constraint_state = None    # mutable per-sequence grammar/FSM state
+
+        # Prefix-cache restore bookkeeping: set by the scheduler when a cached
+        # prefix is reused; consumed by ModelRunner to restore DeltaNet state.
+        self.prefix_restore_blocks: tuple | None = None
+
     def __len__(self):
         return self.num_tokens
 

@@ -28,6 +28,13 @@ class Config:
     eos: list = None  # populated from hf_config in __post_init__
     # Chunked prefill
     max_prefill_chunk_tokens: int = 4096
+    # Prefix caching: reuse KV-cache blocks (and DeltaNet recurrent state)
+    # across requests that share a common token prefix.
+    enable_prefix_caching: bool = True
+    max_prefix_states: int = 64  # max cached DeltaNet state snapshots
+    # Multi-step scheduling: run this many decode steps per scheduler
+    # invocation to amortize Python/scheduling overhead. 1 = disabled.
+    num_scheduler_steps: int = 1
     # Tensor parallelism
     tp_size: int = 1
     # NCCL

@@ -56,6 +56,11 @@ class LLMEngine:
         # Initialize scheduler with tokenizer (for stop string checks)
         self.scheduler = Scheduler(self.config, tokenizer=self.tokenizer)
         self.scheduler.on_preempt = lambda seq: self.model_runner.free_deltanet_slot(seq.seq_id)
+        # Prefix-cache callbacks (DeltaNet state snapshots live in ModelRunner).
+        self.scheduler.on_prefix_hit = (
+            lambda seq, matched, n: self.model_runner.prefix_state_exists(matched))
+        self.scheduler.on_prefix_save = self.model_runner.save_prefix_state
+        self.scheduler.on_block_freed = self.model_runner.evict_prefix_state
 
         # Track all sequences for result collection and cleanup
         self._all_seqs: dict[int, Sequence] = {}
@@ -145,6 +150,9 @@ class LLMEngine:
             raise ValueError("Prompt produced no tokens after tokenization")
 
         seq = Sequence(token_ids, sampling_params)
+        # Build the constrained-decoding constraint (if any) from sampling params.
+        from engine.constraints import make_constraint
+        seq.constraint = make_constraint(sampling_params, self.tokenizer)
         self.scheduler.add(seq)
         self._all_seqs[seq.seq_id] = seq
         return seq
@@ -155,25 +163,60 @@ class LLMEngine:
         if not seqs:
             return []
         self.model_runner.oom_preempted.clear()
+
+        # Multi-step scheduling: run several decode steps on the same batch to
+        # amortize per-step Python/scheduling overhead. Only applies to pure
+        # decode steps (no prefill sequence mixed in).
+        if (not is_prefill and self.config.num_scheduler_steps > 1
+                and all(not s.is_prefill for s in seqs)):
+            return self._multi_step_decode(seqs)
+
         token_ids = self.model_runner.run(seqs, is_prefill)
 
-        # Handle sequences that were dropped due to OOM during execution.
-        # Put them back into the scheduler's waiting queue for recompute.
+        self._handle_preempted()
+
+        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+
+        return self._finalize_finished(seqs)
+
+    def _handle_preempted(self):
+        """Re-queue sequences dropped due to OOM during execution."""
         for preempted_seq in self.model_runner.oom_preempted:
             preempted_seq.status = SequenceStatus.WAITING
             preempted_seq.is_prefill = True
             preempted_seq.num_cached_tokens = 0
-            self.scheduler.block_manager.deallocate(preempted_seq)
+            preempted_seq.prefix_restore_blocks = None
+            self.scheduler.deallocate(preempted_seq)
             self.scheduler.waiting.appendleft(preempted_seq)
             if preempted_seq.seq_id in self.scheduler.running:
                 del self.scheduler.running[preempted_seq.seq_id]
+        self.model_runner.oom_preempted.clear()
 
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
-
+    def _finalize_finished(self, seqs: list[Sequence]) -> list[Sequence]:
+        """Free DeltaNet slots and tracking state for finished sequences."""
         finished = [seq for seq in seqs if seq.is_finished]
         for seq in finished:
             self.model_runner.free_deltanet_slot(seq.seq_id)
             self._all_seqs.pop(seq.seq_id, None)
+        return finished
+
+    def _multi_step_decode(self, seqs: list[Sequence]) -> list[Sequence]:
+        """Run ``num_scheduler_steps`` decode steps on one scheduled batch."""
+        batch: list[Sequence] = list(seqs)
+        finished: list[Sequence] = []
+
+        for _ in range(self.config.num_scheduler_steps):
+            if not batch:
+                break
+            token_ids = self.model_runner.run(batch, False)
+            self._handle_preempted()
+            self.scheduler.postprocess(batch, token_ids, False)
+            finished.extend(self._finalize_finished(
+                [s for s in batch if s.is_finished]))
+            batch = [s for s in batch if not s.is_finished]
+            if batch:
+                self.scheduler.advance_decode(batch)
+
         return finished
 
     def generate(

@@ -11,7 +11,7 @@ Handles:
 - Tensor Parallelism support
 """
 import bisect
-from collections import deque
+from collections import deque, OrderedDict
 
 import torch
 from engine.config import Config
@@ -19,6 +19,7 @@ from engine.sequence import Sequence, SequenceStatus
 from engine.context import AttentionContext, set_context, reset_context
 from engine.parallel import (get_tp_rank, get_tp_world_size, is_tp_active,
                              tp_broadcast, tp_distributed_argmax, tp_distributed_argmax_fused)
+from engine.constraints import seqs_have_constraints
 from kernels.lm_head_topk import fused_lm_head_argmax, fused_lm_head_argmax_with_max
 
 
@@ -126,6 +127,10 @@ class ModelRunner:
 
         # Cache for chunked prefill gather indices: (seq_id, start) -> (block_table_copy, slot_mapping_tensor)
         self._prefill_gather_cache: dict[tuple[int, int], tuple[list[int], torch.Tensor]] = {}
+
+        # Prefix-cache DeltaNet state snapshots: block_chain tuple -> (rec_cpu, conv_cpu)
+        self.prefix_state_cache: OrderedDict = OrderedDict()
+        self.max_prefix_states = config.max_prefix_states
 
     def load_model(self):
         """Load Qwen3.6-27B model and apply tilelang kernels.
@@ -313,6 +318,43 @@ class ModelRunner:
         keys_to_remove = [k for k in self._prefill_gather_cache if k[0] == seq_id]
         for k in keys_to_remove:
             del self._prefill_gather_cache[k]
+
+    # --- Prefix-cache DeltaNet state snapshots ------------------------------- #
+    def prefix_state_exists(self, block_chain) -> bool:
+        """Return True if a DeltaNet state snapshot exists for ``block_chain``."""
+        return tuple(block_chain) in self.prefix_state_cache
+
+    def save_prefix_state(self, seq, block_chain):
+        """Snapshot this sequence's DeltaNet state for a cached prefix boundary."""
+        key = tuple(block_chain)
+        if key in self.prefix_state_cache:
+            self.prefix_state_cache.move_to_end(key)
+            return
+        slot = self.seq_to_slot.get(seq.seq_id)
+        if slot is None:
+            return
+        rec = self.deltanet_recurrent_pool[:, slot].clone().cpu()
+        conv = self.deltanet_conv_pool[:, slot].clone().cpu()
+        self.prefix_state_cache[key] = (rec, conv)
+        self.prefix_state_cache.move_to_end(key)
+        while len(self.prefix_state_cache) > self.max_prefix_states:
+            self.prefix_state_cache.popitem(last=False)
+
+    def restore_prefix_state(self, seq, block_chain):
+        """Restore a cached DeltaNet state snapshot into this sequence's slot."""
+        key = tuple(block_chain)
+        entry = self.prefix_state_cache.get(key)
+        if entry is None:
+            return
+        slot = self.allocate_deltanet_slot(seq.seq_id)
+        self.deltanet_recurrent_pool[:, slot].copy_(entry[0])
+        self.deltanet_conv_pool[:, slot].copy_(entry[1])
+        self.prefix_state_cache.move_to_end(key)
+
+    def evict_prefix_state(self, block_id: int):
+        """Drop state snapshots whose block chain references a freed block."""
+        for key in [k for k in list(self.prefix_state_cache) if block_id in k]:
+            del self.prefix_state_cache[key]
 
     @torch.inference_mode()
     def _decode_forward_logits(self, input_ids: torch.Tensor, positions: torch.Tensor,
@@ -713,6 +755,10 @@ class ModelRunner:
         for seq in seqs:
             if seq.seq_id not in self.seq_to_slot:
                 self.allocate_deltanet_slot(seq.seq_id)
+            # Restore DeltaNet recurrent state reused from the prefix cache.
+            if seq.prefix_restore_blocks is not None:
+                self.restore_prefix_state(seq, seq.prefix_restore_blocks)
+                seq.prefix_restore_blocks = None
 
         # Zero DeltaNet state when re-prefilling from scratch (e.g. after preemption).
         # Preemption releases KV blocks and resets num_cached_tokens to 0, but the
@@ -811,9 +857,9 @@ class ModelRunner:
                 else:
                     all_greedy = all(seq.temperature < 1e-6 for seq in seqs)
                     has_rep_penalty = any(seq.repetition_penalty > 1.0 for seq in seqs)
-                    # Fused greedy argmax can't apply repetition penalty; fall back
-                    # to materialized logits when penalty is active.
-                    if all_greedy and not has_rep_penalty:
+                    # Fused greedy argmax can't apply repetition penalty or
+                    # constraints; fall back to materialized logits then.
+                    if all_greedy and not has_rep_penalty and not seqs_have_constraints(seqs):
                         token_ids = self._decode_greedy_fused(hidden, seqs)
                     else:
                         logits = self.model.lm_head(hidden)
@@ -905,6 +951,28 @@ class ModelRunner:
             )
             logits_i[idx_tensor] = penalized
 
+    def _apply_constraints(self, logits: torch.Tensor, seqs: list[Sequence]):
+        """Apply per-sequence constraints to sharded logits [bsz, vocab_shard]."""
+        if not seqs_have_constraints(seqs):
+            return
+        vocab_shard = logits.shape[-1]
+        vocab_offset = self.tp_rank * vocab_shard
+        vocab_size = self.model.lm_head.weight.shape[0] * self.tp_size
+        for i, seq in enumerate(seqs):
+            c = getattr(seq, 'constraint', None)
+            if c is not None:
+                c.apply(logits[i], seq, vocab_offset, vocab_shard, vocab_size)
+
+    def _apply_constraints_full(self, logits: torch.Tensor, seqs: list[Sequence]):
+        """Apply per-sequence constraints to full-vocab logits [bsz, vocab]."""
+        if not seqs_have_constraints(seqs):
+            return
+        vocab_size = logits.shape[-1]
+        for i, seq in enumerate(seqs):
+            c = getattr(seq, 'constraint', None)
+            if c is not None:
+                c.apply(logits[i], seq, 0, vocab_size, vocab_size)
+
     def _sample_decode(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
         """Optimized decode sampling: uses distributed argmax for greedy, avoids .item() syncs."""
         if logits.dim() == 3:
@@ -912,6 +980,9 @@ class ModelRunner:
 
         # Apply repetition penalty before any sampling/argmax.
         self._apply_repetition_penalty(logits, seqs)
+
+        # Apply constrained-decoding masks (logit_bias / allowed / guided).
+        self._apply_constraints(logits, seqs)
 
         all_greedy = all(seq.temperature < 1e-6 for seq in seqs)
 
@@ -1040,9 +1111,11 @@ class ModelRunner:
         seq = seqs[0]
         last_hidden = hidden[0, -1, :]
         has_rep_penalty = seq.repetition_penalty > 1.0
+        has_constraint = seq.constraint is not None
 
-        # Fast path: greedy without repetition penalty can use fused argmax.
-        if seq.temperature < 1e-6 and not has_rep_penalty:
+        # Fast path: greedy without repetition penalty or constraints can use
+        # the fused argmax kernel.
+        if seq.temperature < 1e-6 and not has_rep_penalty and not has_constraint:
             if self.tp_size > 1:
                 local_idx, local_max = fused_lm_head_argmax_with_max(
                     last_hidden.unsqueeze(0), self.model.lm_head.weight)
@@ -1053,7 +1126,7 @@ class ModelRunner:
                 token_tensor = fused_lm_head_argmax(last_hidden, self.model.lm_head.weight)
                 return [token_tensor[0].item()]
 
-        # Materialize logits (needed for sampling or repetition penalty).
+        # Materialize logits (needed for sampling, repetition penalty, constraints).
         logits = self.model.lm_head(hidden)
         if self.tp_size > 1:
             logits = self._all_gather_logits(logits)
@@ -1062,6 +1135,10 @@ class ModelRunner:
         # Apply repetition penalty on the last token's logits.
         if has_rep_penalty:
             self._apply_repetition_penalty(last_logits.unsqueeze(0), [seq])
+
+        # Apply constrained-decoding masks.
+        if has_constraint:
+            self._apply_constraints_full(last_logits.unsqueeze(0), [seq])
 
         if seq.temperature < 1e-6:
             return [last_logits.argmax().item()]

@@ -32,6 +32,10 @@ class BlockManager:
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.free_block_ids: list[int] = list(range(num_blocks - 1, -1, -1))
         self.used_block_ids: set[int] = set()
+        # Invoked with a block_id when that block is truly returned to the free
+        # pool (ref_count 0). Used by the scheduler to evict stale prefix-cache
+        # entries referencing the freed block.
+        self.on_block_freed = None
 
     @property
     def num_free_blocks(self) -> int:
@@ -61,15 +65,44 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = 0
 
-    def deallocate(self, seq: Sequence):
-        """Release all blocks held by a sequence."""
+    def share_blocks(self, seq: Sequence, block_ids: list[int]):
+        """Adopt pre-existing blocks (prefix-cache hit) into a sequence.
+
+        Increments each block's reference count. The KV contents of these blocks
+        are already valid for the shared prefix and must not be recomputed.
+        """
+        assert not seq.block_table
+        seq.block_table = list(block_ids)
+        for block_id in block_ids:
+            self.blocks[block_id].ref_count += 1
+
+    def can_allocate_remaining(self, seq: Sequence) -> bool:
+        """Check whether the blocks still needed for ``seq`` are available."""
+        return self.num_free_blocks >= (seq.num_blocks - len(seq.block_table))
+
+    def allocate_extra(self, seq: Sequence):
+        """Allocate the blocks still needed to reach ``seq.num_blocks``."""
+        while len(seq.block_table) < seq.num_blocks:
+            seq.block_table.append(self._allocate_block())
+
+    def deallocate(self, seq: Sequence) -> list[int]:
+        """Release all blocks held by a sequence.
+
+        Returns the list of block ids that were fully freed (ref_count reached
+        0). Shared blocks (ref_count > 0) are only decremented, not freed.
+        """
+        freed: list[int] = []
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count <= 0:
                 block.ref_count = 0
                 self._deallocate_block(block_id)
+                freed.append(block_id)
+                if self.on_block_freed is not None:
+                    self.on_block_freed(block_id)
         seq.block_table.clear()
+        return freed
 
     def can_append(self, seq: Sequence) -> bool:
         """Check if we can append one more token (may need a new block)."""

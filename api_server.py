@@ -27,13 +27,25 @@ def make_sampling_params(data):
     """从请求体构造 SamplingParams。"""
     stop = data.get("stop")
     stop = [stop] if isinstance(stop, str) else (stop or [])
+    # OpenAI 的 response_format: {"type": "json_object"} 映射为 JSON 约束解码
+    guided_json = data.get("guided_json")
+    if guided_json is None and isinstance(data.get("response_format"), dict) \
+            and data["response_format"].get("type") == "json_object":
+        guided_json = True
     return SamplingParams(
         temperature=float(data.get("temperature", 0.6)),
         top_p=float(data.get("top_p", 1.0)),
         top_k=int(data.get("top_k", -1)),
         max_tokens=int(data.get("max_tokens", 256)),
         repetition_penalty=float(data.get("repetition_penalty", 1.0)),
-        stop=stop)
+        stop=stop,
+        logit_bias=data.get("logit_bias") or {},
+        allowed_token_ids=data.get("allowed_token_ids") or [],
+        bad_token_ids=data.get("bad_token_ids") or [],
+        guided_choice=data.get("guided_choice") or [],
+        guided_json=guided_json,
+        guided_regex=data.get("guided_regex"),
+    )
 
 def broadcast_work(prompt, params):
     """rank 0 广播 prompt 与参数，唤醒 worker 参与本轮推理。"""
@@ -174,12 +186,17 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=4096)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     ap.add_argument("--enforce-eager", action="store_true")
+    ap.add_argument("--num-scheduler-steps", type=int, default=1,
+                    help="多步调度：每次调度执行的解码步数（1 = 关闭）")
+    ap.add_argument("--no-prefix-caching", action="store_true", help="禁用前缀缓存")
     args = ap.parse_args()
 
     MODEL_NAME = os.path.basename(os.path.normpath(args.model)) or args.model
     print(f"初始化引擎: model={args.model}, tp_size={args.tp_size}")
     llm = LLM(model=args.model, max_num_seqs=args.max_num_seqs, max_model_len=args.max_model_len,
-              gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=args.enforce_eager, tp_size=args.tp_size)
+              gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=args.enforce_eager,
+              tp_size=args.tp_size, num_scheduler_steps=args.num_scheduler_steps,
+              enable_prefix_caching=not args.no_prefix_caching)
 
     # TP>1 时：rank 0 启动 HTTP 服务器，其余 rank 进入 worker 循环参与推理
     if args.tp_size > 1 and get_tp_rank() != 0:
