@@ -26,7 +26,7 @@ class Block:
 class BlockManager:
     """Manages paged KV cache blocks."""
 
-    def __init__(self, num_blocks: int, block_size: int, swap_space_bytes: int = 0):
+    def __init__(self, num_blocks: int, block_size: int):
         self.block_size = block_size
         self.num_blocks = num_blocks
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]

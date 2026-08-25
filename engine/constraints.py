@@ -690,6 +690,11 @@ class JsonGrammar:
 class Constraint:
     """Base class for a per-sequence sampling constraint."""
 
+    # Whether this constraint defines a terminal generation state (e.g. a
+    # completed choice/JSON/regex). Mask-style constraints (logit bias,
+    # allow/deny lists) never terminate on their own.
+    terminable = False
+
     def apply(self, logits: torch.Tensor, seq, vocab_offset: int,
               vocab_shard: int, vocab_size: int):
         raise NotImplementedError
@@ -734,6 +739,8 @@ class TokenMaskConstraint(Constraint):
 
 
 class ChoiceConstraint(Constraint):
+    terminable = True
+
     def __init__(self, choices: list[str], tokenizer):
         self.tokenizer = tokenizer
         self.root: dict = {}
@@ -772,6 +779,8 @@ class ChoiceConstraint(Constraint):
 
 class _GrammarConstraint(Constraint):
     """Shared machinery for JSON / regex constraints."""
+
+    terminable = True
 
     def __init__(self, tokenizer, vocab_size: int):
         self.tokenizer = tokenizer
@@ -859,7 +868,11 @@ class CompositeConstraint(Constraint):
             c.advance(seq, token_id)
 
     def is_complete(self, seq) -> bool:
-        return any(c.is_complete(seq) for c in self.constraints)
+        # Every terminable sub-constraint must be satisfied (e.g. both a
+        # guided JSON and a guided regex). Mask-style constraints are never
+        # terminable and must not hold up completion.
+        terminable = [c for c in self.constraints if c.terminable]
+        return bool(terminable) and all(c.is_complete(seq) for c in terminable)
 
 
 # --------------------------------------------------------------------------- #

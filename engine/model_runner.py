@@ -505,36 +505,6 @@ class ModelRunner:
             return buckets[idx]
         return None
 
-    def _run_decode_graph(self, input_ids: torch.Tensor, positions: torch.Tensor,
-                          ctx: AttentionContext, n: int) -> torch.Tensor:
-        """Copy real decode inputs into static buffers, replay the graph, return logits[:n]."""
-        bsz = self._select_bucket(n)
-        runner = self.cuda_graphs[bsz]
-
-        runner.static_input_ids[:n].copy_(input_ids)
-        runner.static_positions[:n].copy_(positions)
-        runner.static_slot_mapping[:n].copy_(ctx.slot_mapping)
-        width = ctx.block_tables.shape[1]
-        runner.static_block_tables[:n, :width].copy_(ctx.block_tables)
-        runner.static_context_lens[:n].copy_(ctx.context_lens)
-        runner.static_deltanet_slots[:n].copy_(ctx.deltanet_slots)
-
-        # Reset padded rows so they cannot corrupt real state.
-        if n < bsz:
-            runner.static_slot_mapping[n:].fill_(-1)
-            runner.static_deltanet_slots[n:].fill_(self.padding_deltanet_slot)
-            runner.static_context_lens[n:].fill_(1)
-            runner.static_block_tables[n:].fill_(-1)
-
-        # Clear residual columns beyond current width to prevent stale block ids
-        # from a previous (wider) batch from being read by the paged attention kernel.
-        max_blocks = runner.static_block_tables.shape[1]
-        if width < max_blocks:
-            runner.static_block_tables[:n, width:].fill_(-1)
-
-        runner.graph.replay()
-        return runner.static_logits[:n]
-
     def _prepare_decode_into_graph(self, seqs: list[Sequence], runner: CUDAGraphRunner, n: int):
         """Prepare decode inputs directly into CUDA graph static buffers.
 

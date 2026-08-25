@@ -27,7 +27,6 @@ class Scheduler:
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(
             config.num_kvcache_blocks, config.kvcache_block_size,
-            swap_space_bytes=config.swap_space_bytes,
         )
         self.waiting: deque[Sequence] = deque()
         self.running: OrderedDict[int, Sequence] = OrderedDict()

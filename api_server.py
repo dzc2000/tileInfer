@@ -5,6 +5,7 @@
 import os, argparse, json, time, uuid, threading
 os.environ.setdefault("TILELANG_CACHE_DIR",
                       os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tilelang_cache"))
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import torch, torch.distributed as dist
 from engine.llm import LLM
@@ -47,18 +48,41 @@ def make_sampling_params(data):
         guided_regex=data.get("guided_regex"),
     )
 
-def broadcast_work(prompt, params):
-    """rank 0 广播 prompt 与参数，唤醒 worker 参与本轮推理。"""
-    pb = prompt.encode("utf-8")
-    length = torch.tensor([len(pb)], dtype=torch.long, device="cuda")
+def _broadcast_bytes(data: bytes):
+    """广播一段字节流（先长度后内容）。"""
+    length = torch.tensor([len(data)], dtype=torch.long, device="cuda")
     dist.broadcast(length, src=0)
-    if pb:
-        buf = torch.frombuffer(bytearray(pb), dtype=torch.uint8).to("cuda")
+    if data:
+        buf = torch.frombuffer(bytearray(data), dtype=torch.uint8).to("cuda")
         dist.broadcast(buf, src=0)
-    p = torch.tensor([params.temperature, params.top_p, params.top_k,
-                      params.max_tokens, params.repetition_penalty],
-                     dtype=torch.float32, device="cuda")
-    dist.broadcast(p, src=0)
+
+def _recv_body(n: int) -> bytes:
+    """接收已知长度为 n 的广播内容（n<=0 返回空）。"""
+    if n <= 0:
+        return b""
+    buf = torch.empty(n, dtype=torch.uint8, device="cuda")
+    dist.broadcast(buf, src=0)
+    return buf.cpu().numpy().tobytes()
+
+def _recv_bytes() -> bytes:
+    length = torch.tensor([0], dtype=torch.long, device="cuda")
+    dist.broadcast(length, src=0)
+    return _recv_body(int(length.item()))
+
+def _params_to_bytes(params) -> bytes:
+    """完整序列化 SamplingParams（含 stop / 约束解码参数），保证 TP 各 rank 一致。"""
+    return json.dumps(asdict(params), ensure_ascii=False).encode("utf-8")
+
+def _params_from_bytes(data: bytes) -> SamplingParams:
+    d = json.loads(data.decode("utf-8"))
+    # JSON 会把 logit_bias 的 int 键变成字符串，恢复为 token id
+    d["logit_bias"] = {int(k): v for k, v in (d.get("logit_bias") or {}).items()}
+    return SamplingParams(**d)
+
+def broadcast_work(prompt, params):
+    """rank 0 广播 prompt 与完整采样参数，唤醒 worker 参与本轮推理。"""
+    _broadcast_bytes(prompt.encode("utf-8"))
+    _broadcast_bytes(_params_to_bytes(params))
 
 def worker_loop():
     """非 rank 0 的 worker：循环接收广播并参与推理。"""
@@ -67,16 +91,10 @@ def worker_loop():
         dist.broadcast(length, src=0)
         if int(length.item()) == -1:
             break  # 退出信号
-        n, prompt = int(length.item()), ""
-        if n > 0:
-            buf = torch.empty(n, dtype=torch.uint8, device="cuda")
-            dist.broadcast(buf, src=0)
-            prompt = buf.cpu().numpy().tobytes().decode("utf-8")
-        p = torch.zeros(5, dtype=torch.float32, device="cuda")
-        dist.broadcast(p, src=0)
-        llm.generate([prompt], SamplingParams(
-            temperature=p[0].item(), top_p=p[1].item(), top_k=int(p[2].item()),
-            max_tokens=int(p[3].item()), repetition_penalty=p[4].item()))
+        # prompt 的长度已在上面接收（用于区分退出信号），只补收内容
+        prompt = _recv_body(int(length.item())).decode("utf-8")
+        params = _params_from_bytes(_recv_bytes())
+        llm.generate([prompt], params)
 
 def run_inference(prompt, params):
     """非流式推理。"""
@@ -171,6 +189,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except Exception as e:
             send({"error": {"message": str(e), "type": "internal_error"}})
+            # OpenAI 兼容客户端依赖 [DONE] 判断流结束，异常路径也要发送
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
 
     def log_message(self, *a):
         pass  # 静默默认日志

@@ -6,11 +6,11 @@ A high-performance inference engine for **Qwen3.6-27B**, built on custom TileLan
 
 | Feature | Description |
 |---------|-------------|
-| **INT8 Weight-Only Quantization** | Per-channel W8A16 quantization with online dequantization in GEMV kernel, 2× bandwidth reduction |
+| **INT8 Weight-Only Quantization** | Per-channel W8A16 quantization, 2× weight-memory reduction. Decode uses register-level dequantize GEMV; prefill dequantizes to BF16 on the fly for GEMM |
 | **BitBLAS-style GEMV Kernel** | Register-level dequantize GEMV with `T.vectorized` 128-bit loads and warp shuffle reduction |
 | **Fused TileLang Kernels** | Custom kernels for RMSNorm, RoPE, SiLU, GQA attention, DeltaNet recurrent states |
 | **Mixed Batching** | Decode + prefill sequences coexist in one step (serial prefill, parallel decode) |
-| **Paged KV Cache** | Block-based KV cache management with SWAP preemption |
+| **Paged KV Cache** | Block-based KV cache management with RECOMPUTE preemption |
 | **Continuous Batching** | Dynamic batching with iterative scheduler (no recursion) |
 | **Chunked Prefill** | Split long prefill sequences into chunks to avoid memory spikes |
 | **Prefix Caching** | Reuse KV-cache blocks + DeltaNet recurrent state across requests sharing a token prefix |
@@ -176,7 +176,7 @@ tileInfer/
 ## Optimizations
 
 ### Quantization
-1. **INT8 Weight-Only (W8A16)** — Per-channel quantization, online dequantization in GEMV kernel, 2× bandwidth reduction
+1. **INT8 Weight-Only (W8A16)** — Per-channel quantization, 2× weight-memory reduction. Decode (M=1) runs the BitBLAS-style dequantize GEMV kernel; prefill (M>1) falls back to BF16 GEMM with on-the-fly dequantization
 2. **BitBLAS-style GEMV** — Pure register (`alloc_local`) design, no shared memory sync, warp shuffle reduction, `T.vectorized(8)` for 128-bit loads
 
 ### Kernel Fusion
@@ -189,7 +189,7 @@ tileInfer/
 ### Scheduling
 8. **Mixed Batching** — Decode + prefill in same step, iterative scheduler (no recursion)
 9. **Serial Prefill** — One prefill per step for DeltaNet state compatibility
-10. **SWAP Preemption** — Swap DeltaNet state to CPU instead of recomputing from scratch
+10. **RECOMPUTE Preemption** — Under memory pressure, release a sequence's blocks and re-prefill it later (no CPU swap space involved)
 11. **Distributed Top-k Sampling** — Only gather top-k logits across TP ranks (vs full vocab)
 
 ### Infrastructure

@@ -171,6 +171,12 @@ class LLMEngine:
                 and all(not s.is_prefill for s in seqs)):
             return self._multi_step_decode(seqs)
 
+        # Mixed batch (decode + chunked prefill co-scheduled): the model
+        # runner has no fused mixed-batch path, so execute the prefill
+        # sub-batch and the decode sub-batch as two separate steps.
+        if not is_prefill and any(s.is_prefill for s in seqs):
+            return self._run_mixed_batch(seqs)
+
         token_ids = self.model_runner.run(seqs, is_prefill)
 
         self._handle_preempted()
@@ -178,6 +184,23 @@ class LLMEngine:
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
 
         return self._finalize_finished(seqs)
+
+    def _run_mixed_batch(self, seqs: list[Sequence]) -> list[Sequence]:
+        """Execute a mixed batch: prefill sub-batch first, then decode."""
+        prefill_seqs = [s for s in seqs if s.is_prefill]
+        decode_seqs = [s for s in seqs if not s.is_prefill]
+        finished: list[Sequence] = []
+
+        for sub_batch, sub_is_prefill in ((prefill_seqs, True),
+                                          (decode_seqs, False)):
+            if not sub_batch:
+                continue
+            token_ids = self.model_runner.run(sub_batch, sub_is_prefill)
+            self._handle_preempted()
+            self.scheduler.postprocess(sub_batch, token_ids, sub_is_prefill)
+            finished.extend(self._finalize_finished(sub_batch))
+
+        return finished
 
     def _handle_preempted(self):
         """Re-queue sequences dropped due to OOM during execution."""
@@ -262,7 +285,10 @@ class LLMEngine:
     ):
         """Generate completions with streaming output.
 
-        Yields (seq_index, token_text, is_finished) for each token generated.
+        Yields (seq_index, new_text, is_finished) whenever new text is
+        available. Multi-token characters (e.g. Chinese) stay intact because
+        the whole completion is decoded at once; incomplete trailing UTF-8
+        byte sequences are held back until their remaining tokens arrive.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -272,33 +298,38 @@ class LLMEngine:
             seq = self.add_request(prompt, sampling_params)
             seqs.append(seq)
 
-        # Track which tokens have been yielded per sequence
-        yielded_count = [0] * len(seqs)
+        # Cumulative text already yielded to the caller, per sequence.
+        yielded_text = [""] * len(seqs)
+
+        def _new_text(seq, i: int) -> str:
+            full = self.tokenizer.decode(seq.completion_token_ids,
+                                         skip_special_tokens=True)
+            # A partial multi-byte character decodes to U+FFFD; withhold it
+            # until the character is complete.
+            safe = full.rstrip("\ufffd")
+            prev = yielded_text[i]
+            new = safe[len(prev):] if safe.startswith(prev) else safe
+            yielded_text[i] = safe
+            return new
 
         try:
             while not self.scheduler.is_finished():
                 finished_seqs = self.step()
 
-                # Yield newly generated tokens
+                # Yield newly generated text
                 for i, seq in enumerate(seqs):
                     if seq.is_finished:
                         continue
-                    new_count = len(seq.completion_token_ids)
-                    while yielded_count[i] < new_count:
-                        token_id = seq.completion_token_ids[yielded_count[i]]
-                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                        yielded_count[i] += 1
-                        yield (i, token_text, False)
+                    new_text = _new_text(seq, i)
+                    if new_text:
+                        yield (i, new_text, False)
 
-                # Yield final token for finished sequences
+                # Yield remaining text for finished sequences
                 for seq in finished_seqs:
                     i = seqs.index(seq)
-                    new_count = len(seq.completion_token_ids)
-                    while yielded_count[i] < new_count:
-                        token_id = seq.completion_token_ids[yielded_count[i]]
-                        token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
-                        yielded_count[i] += 1
-                        yield (i, token_text, True)
+                    new_text = _new_text(seq, i)
+                    if new_text:
+                        yield (i, new_text, True)
         finally:
             self._cleanup_seqs(seqs)
 
@@ -325,7 +356,12 @@ class LLMEngine:
         return [seq.completion_token_ids for seq in seqs]
 
     def _cleanup_seqs(self, seqs: list[Sequence]):
-        """Clean up all sequences: free DeltaNet slots and remove from tracking."""
+        """Clean up sequences that are still tracked.
+
+        Finished sequences were already finalized by ``_finalize_finished``
+        (slot freed, removed from ``_all_seqs``); only sequences still being
+        tracked (e.g. generation aborted by an exception) need cleanup here.
+        """
         for seq in seqs:
-            self.model_runner.free_deltanet_slot(seq.seq_id)
-            self._all_seqs.pop(seq.seq_id, None)
+            if self._all_seqs.pop(seq.seq_id, None) is not None:
+                self.model_runner.free_deltanet_slot(seq.seq_id)

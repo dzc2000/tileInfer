@@ -19,7 +19,6 @@ class Config:
     gpu_memory_utilization: float = 0.9
     kvcache_block_size: int = 16
     num_kvcache_blocks: int = -1  # auto-computed
-    swap_space_bytes: int = 0  # CPU offload for SWAP preemption (0 = disabled)
     # Model
     enforce_eager: bool = False
     # CUDA Graph: max decode batch size captured (powers-of-two buckets up to this)
